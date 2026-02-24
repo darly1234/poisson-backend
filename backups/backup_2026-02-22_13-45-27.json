@@ -1,0 +1,122 @@
+{
+  "timestamp": "2026-02-22T16:45:27.590Z",
+  "records": [
+    {
+      "id": "I-003",
+      "data": {
+        "f1": "Teste"
+      },
+      "created_at": "2026-02-22T15:08:20.957Z",
+      "updated_at": "2026-02-22T15:08:23.421Z"
+    },
+    {
+      "id": "I-004",
+      "data": {
+        "f1": "teste2"
+      },
+      "created_at": "2026-02-22T15:08:34.740Z",
+      "updated_at": "2026-02-22T15:08:37.431Z"
+    }
+  ],
+  "metadata": {
+    "id": 1,
+    "tabs": [
+      {
+        "id": "t1",
+        "icon": "t1",
+        "label": "Administrativo",
+        "fields": [
+          {
+            "id": "f1",
+            "isBI": true,
+            "type": "text",
+            "label": "Nome do Autor",
+            "isVisible": true
+          },
+          {
+            "id": "f2",
+            "isBI": false,
+            "type": "phone",
+            "label": "Telefone Autor",
+            "isVisible": false
+          },
+          {
+            "id": "f3",
+            "isBI": true,
+            "type": "select",
+            "label": "Status Relacionamento",
+            "options": [
+              "Ativo",
+              "Em Pausa",
+              "Finalizado"
+            ],
+            "isVisible": true
+          }
+        ]
+      },
+      {
+        "id": "t2",
+        "icon": "t2",
+        "label": "Produção",
+        "fields": [
+          {
+            "id": "f6",
+            "isBI": true,
+            "type": "text",
+            "label": "Título do Livro",
+            "isVisible": true
+          },
+          {
+            "id": "f7",
+            "isBI": false,
+            "type": "isbn",
+            "label": "ISBN",
+            "isVisible": true
+          },
+          {
+            "id": "f10",
+            "isBI": true,
+            "type": "select",
+            "label": "Status Pagamento",
+            "options": [
+              "Pendente",
+              "Pago",
+              "Atrasado"
+            ],
+            "isVisible": true
+          },
+          {
+            "id": "f11",
+            "isBI": true,
+            "type": "number",
+            "label": "Páginas",
+            "isVisible": true
+          }
+        ]
+      },
+      {
+        "id": "t3",
+        "icon": "t3",
+        "label": "Financeiro",
+        "fields": [
+          {
+            "id": "f9",
+            "isBI": true,
+            "type": "currency",
+            "label": "Valor Pagamento",
+            "isVisible": true
+          },
+          {
+            "id": "f20",
+            "isBI": false,
+            "type": "file",
+            "label": "Documentação",
+            "isVisible": true
+          }
+        ]
+      }
+    ],
+    "updated_at": "2026-02-22T16:32:36.233Z"
+  },
+  "filters": []
+}
