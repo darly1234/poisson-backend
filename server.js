@@ -9,18 +9,32 @@ const metadataRouter = require('./src/routes/metadata');
 const filtersRouter = require('./src/routes/filters');
 const backupRouter = require('./src/routes/backup');
 const crossrefRouter = require('./src/routes/crossref');
+const wordpressRouter = require('./src/routes/wordpress');
+const filesRouter = require('./src/routes/files');
+const authRouter = require('./src/routes/auth');
+const { requireAuth } = require('./src/middleware/authMiddleware');
+const cookieParser = require('cookie-parser');
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: process.env.APP_URL || 'http://localhost:3000', credentials: true }));
+app.use(cookieParser());
+app.use(express.json({ limit: '50mb' }));
 app.use(fileUpload());
+
+// Rotas públicas (sem autenticação)
+app.use('/api/auth', authRouter);
+
+// Proteção JWT em todas as rotas abaixo
+app.use(requireAuth);
 
 app.use('/api/records', recordsRouter);
 app.use('/api/metadata', metadataRouter);
 app.use('/api/filters', filtersRouter);
 app.use('/api/backup', backupRouter);
 app.use('/api/crossref', crossrefRouter);
+app.use('/api/wordpress', wordpressRouter);
+app.use('/api/files', filesRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

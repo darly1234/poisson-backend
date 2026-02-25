@@ -1,0 +1,263 @@
+const express = require('express');
+const router = express.Router();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
+const { Pool } = require('pg');
+
+const pool = new Pool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    database: process.env.DB_NAME,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+});
+
+const JWT_SECRET = process.env.JWT_SECRET || 'poisson-jwt-secret-change-in-production';
+const JWT_EXPIRES = '15m';
+const REFRESH_EXPIRES_DAYS = 7;
+const BCRYPT_ROUNDS = 12;
+const APP_URL = process.env.APP_URL || 'http://localhost:3000';
+
+// Rate limiting
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    message: { message: 'Muitas tentativas. Tente novamente em 15 minutos.' },
+    standardHeaders: true, legacyHeaders: false,
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function generateAccessToken(user) {
+    return jwt.sign(
+        { id: user.id, email: user.email, name: user.name, role: user.role },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES }
+    );
+}
+
+async function createRefreshToken(userId, res) {
+    const token = crypto.randomBytes(64).toString('hex');
+    const hash = crypto.createHash('sha256').update(token).digest('hex');
+    const expires = new Date(Date.now() + REFRESH_EXPIRES_DAYS * 24 * 60 * 60 * 1000);
+
+    await pool.query(
+        'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+        [userId, hash, expires]
+    );
+
+    res.cookie('refresh_token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge: REFRESH_EXPIRES_DAYS * 24 * 60 * 60 * 1000,
+        path: '/api/auth',
+    });
+
+    return token;
+}
+
+function getMailer() {
+    return nodemailer.createTransport({
+        host: process.env.SMTP_HOST || 'smtp.gmail.com',
+        port: parseInt(process.env.SMTP_PORT || '587'),
+        secure: false,
+        auth: {
+            user: process.env.SMTP_USER,
+            pass: process.env.SMTP_PASS,
+        },
+    });
+}
+
+// ── Registro ──────────────────────────────────────────────────────────────────
+router.post('/register', authLimiter, async (req, res) => {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password)
+        return res.status(400).json({ message: 'Nome, e-mail e senha são obrigatórios.' });
+    if (password.length < 8)
+        return res.status(400).json({ message: 'A senha deve ter pelo menos 8 caracteres.' });
+
+    try {
+        const exists = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+        if (exists.rows.length)
+            return res.status(409).json({ message: 'Este e-mail já está cadastrado.' });
+
+        const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+        const { rows } = await pool.query(
+            'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, email, name, role',
+            [name, email.toLowerCase(), hash]
+        );
+        const user = rows[0];
+
+        const accessToken = generateAccessToken(user);
+        await createRefreshToken(user.id, res);
+
+        res.status(201).json({ user, accessToken });
+    } catch (err) {
+        res.status(500).json({ message: `Erro interno: ${err.message}` });
+    }
+});
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+router.post('/login', authLimiter, async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password)
+        return res.status(400).json({ message: 'E-mail e senha são obrigatórios.' });
+
+    try {
+        const { rows } = await pool.query(
+            'SELECT id, email, name, role, password_hash FROM users WHERE email = $1',
+            [email.toLowerCase()]
+        );
+        const user = rows[0];
+        if (!user || !user.password_hash)
+            return res.status(401).json({ message: 'Credenciais inválidas.' });
+
+        const valid = await bcrypt.compare(password, user.password_hash);
+        if (!valid)
+            return res.status(401).json({ message: 'Credenciais inválidas.' });
+
+        const accessToken = generateAccessToken(user);
+        await createRefreshToken(user.id, res);
+
+        const { password_hash, ...safeUser } = user;
+        res.json({ user: safeUser, accessToken });
+    } catch (err) {
+        res.status(500).json({ message: `Erro interno: ${err.message}` });
+    }
+});
+
+// ── Refresh Token ─────────────────────────────────────────────────────────────
+router.post('/refresh', async (req, res) => {
+    const token = req.cookies?.refresh_token;
+    if (!token) return res.status(401).json({ message: 'Refresh token ausente.' });
+
+    const hash = crypto.createHash('sha256').update(token).digest('hex');
+
+    try {
+        const { rows } = await pool.query(
+            `SELECT rt.*, u.id as uid, u.email, u.name, u.role
+             FROM refresh_tokens rt JOIN users u ON u.id = rt.user_id
+             WHERE rt.token_hash = $1 AND rt.expires_at > NOW()`,
+            [hash]
+        );
+        const row = rows[0];
+        if (!row) return res.status(401).json({ message: 'Refresh token inválido ou expirado.' });
+
+        // Rotate: delete old, create new
+        await pool.query('DELETE FROM refresh_tokens WHERE token_hash = $1', [hash]);
+
+        const user = { id: row.uid, email: row.email, name: row.name, role: row.role };
+        const accessToken = generateAccessToken(user);
+        await createRefreshToken(user.id, res);
+
+        res.json({ user, accessToken });
+    } catch (err) {
+        res.status(500).json({ message: `Erro interno: ${err.message}` });
+    }
+});
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+router.post('/logout', async (req, res) => {
+    const token = req.cookies?.refresh_token;
+    if (token) {
+        const hash = crypto.createHash('sha256').update(token).digest('hex');
+        await pool.query('DELETE FROM refresh_tokens WHERE token_hash = $1', [hash]).catch(() => { });
+    }
+    res.clearCookie('refresh_token', { path: '/api/auth' });
+    res.json({ ok: true });
+});
+
+// ── Me ────────────────────────────────────────────────────────────────────────
+router.get('/me', async (req, res) => {
+    const auth = req.headers.authorization?.split(' ')[1];
+    if (!auth) return res.status(401).json({ message: 'Token ausente.' });
+    try {
+        const payload = jwt.verify(auth, JWT_SECRET);
+        res.json({ user: payload });
+    } catch {
+        res.status(401).json({ message: 'Token inválido.' });
+    }
+});
+
+// ── Esqueceu a Senha ──────────────────────────────────────────────────────────
+router.post('/forgot-password', authLimiter, async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: 'E-mail obrigatório.' });
+
+    try {
+        const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+        // Sempre retorna sucesso para não revelar se o email existe
+        if (!rows.length) return res.json({ ok: true });
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
+
+        await pool.query(
+            'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
+            [token, expires, rows[0].id]
+        );
+
+        const resetUrl = `${APP_URL}/reset-password?token=${token}`;
+
+        if (process.env.SMTP_USER) {
+            const mailer = getMailer();
+            await mailer.sendMail({
+                from: `Poisson ERP <${process.env.SMTP_USER}>`,
+                to: email,
+                subject: 'Redefinição de senha — Poisson ERP',
+                html: `
+                    <div style="font-family:sans-serif;max-width:480px;margin:auto">
+                        <h2 style="color:#1F2A8A">Redefinir sua senha</h2>
+                        <p>Clique no botão abaixo para criar uma nova senha. O link expira em <strong>1 hora</strong>.</p>
+                        <a href="${resetUrl}" style="display:inline-block;background:#1E88E5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Redefinir Senha</a>
+                        <p style="color:#999;font-size:12px;margin-top:24px">Se não foi você, ignore este e-mail.</p>
+                    </div>
+                `,
+            });
+        } else {
+            // Sem SMTP configurado: log no console para teste
+            console.log(`[auth] Reset URL: ${resetUrl}`);
+        }
+
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ message: `Erro interno: ${err.message}` });
+    }
+});
+
+// ── Reset Senha ───────────────────────────────────────────────────────────────
+router.post('/reset-password', async (req, res) => {
+    const { token, password } = req.body;
+    if (!token || !password)
+        return res.status(400).json({ message: 'Token e nova senha são obrigatórios.' });
+    if (password.length < 8)
+        return res.status(400).json({ message: 'A senha deve ter pelo menos 8 caracteres.' });
+
+    try {
+        const { rows } = await pool.query(
+            'SELECT id FROM users WHERE reset_token = $1 AND reset_token_expires > NOW()',
+            [token]
+        );
+        if (!rows.length)
+            return res.status(400).json({ message: 'Token inválido ou expirado.' });
+
+        const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+        await pool.query(
+            'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
+            [hash, rows[0].id]
+        );
+
+        // Revogar todos os refresh tokens do usuário por segurança
+        await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [rows[0].id]);
+
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ message: `Erro interno: ${err.message}` });
+    }
+});
+
+module.exports = router;
