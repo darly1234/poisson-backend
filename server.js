@@ -11,18 +11,24 @@ const backupRouter = require('./src/routes/backup');
 const crossrefRouter = require('./src/routes/crossref');
 const wordpressRouter = require('./src/routes/wordpress');
 const filesRouter = require('./src/routes/files');
-const authRouter = require('./src/routes/auth');
-const { requireAuth } = require('./src/middleware/authMiddleware');
-const cookieParser = require('cookie-parser');
+const uploadsRouter = require('./src/routes/uploads');
+const path = require('path');
+
+const ANEXOS_PATH = process.env.NODE_ENV === 'production'
+  ? '/var/www/anexos_individuais'
+  : 'C:\\anexos_individuais';
 
 const app = express();
+
+// Servir anexos estaticamente
+app.use('/api/anexos', express.static(ANEXOS_PATH));
 
 // Trust reverse proxy (Apache) for rate limiting and real IP detection
 app.set('trust proxy', 1);
 
 app.use(cors({ origin: process.env.APP_URL || 'http://localhost:3000', credentials: true }));
 app.use(cookieParser());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' }));
 app.use(fileUpload());
 
 // Rotas públicas (sem autenticação)
@@ -38,6 +44,7 @@ app.use('/api/backup', backupRouter);
 app.use('/api/crossref', crossrefRouter);
 app.use('/api/wordpress', wordpressRouter);
 app.use('/api/files', filesRouter);
+app.use('/api/upload', uploadsRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);
