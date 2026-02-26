@@ -39,4 +39,4 @@ async function migrate() {
     console.log('✅ Migração concluída!');
 }
 
-migrate().catch(e => { console.error('❌ Erro:', e.message); process.exit(1); });
+migrate().catch(e => { console.error('❌ Erro Completo:', e); process.exit(1); });
