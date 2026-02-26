@@ -10,10 +10,10 @@ const BASE = process.env.VPS_FILES_BASE || '/home/darly/livros.poisson.com.br';
 // Lê credenciais dos headers (perfil do usuário) com fallback para .env
 function getSshConfig(req) {
     return {
-        host: req.headers['x-ssh-host'] || process.env.VPS_SSH_HOST,
-        port: parseInt(process.env.VPS_SSH_PORT || '22'),
-        username: req.headers['x-ssh-user'] || process.env.VPS_SSH_USER,
-        password: req.headers['x-ssh-password'] || process.env.VPS_SSH_PASSWORD,
+        host: process.env.VPS_SSH_HOST || req.headers['x-ssh-host'],
+        port: parseInt(process.env.VPS_SSH_PORT || req.headers['x-ssh-port'] || '22'),
+        username: process.env.VPS_SSH_USER || req.headers['x-ssh-user'],
+        password: process.env.VPS_SSH_PASSWORD || req.headers['x-ssh-password'],
         readyTimeout: 10000,
     };
 }
