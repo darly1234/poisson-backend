@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
+const fetch = require('node-fetch');
 
 const pool = new Pool({
     host: process.env.DB_HOST,
@@ -72,9 +73,31 @@ function getMailer() {
     });
 }
 
+async function verifyRecaptcha(token) {
+    if (!process.env.RECAPTCHA_SECRET_KEY) return true; // Ignora se não houver chave
+    if (!token) return false;
+    try {
+        const response = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `secret=${process.env.RECAPTCHA_SECRET_KEY}&response=${token}`
+        });
+        const data = await response.json();
+        // Google recomenda score >= 0.5 para fluxos de autenticação
+        return data.success && data.score >= 0.5;
+    } catch (err) {
+        console.error('[Recaptcha Error]', err);
+        return false;
+    }
+}
+
 // ── Registro ──────────────────────────────────────────────────────────────────
 router.post('/register', authLimiter, async (req, res) => {
-    const { name, email, password } = req.body;
+    const { name, email, password, recaptchaToken } = req.body;
+
+    const isHuman = await verifyRecaptcha(recaptchaToken);
+    if (!isHuman) return res.status(403).json({ message: 'Falha na verificação de segurança (Bot detectado).' });
+
     if (!name || !email || !password)
         return res.status(400).json({ message: 'Nome, e-mail e senha são obrigatórios.' });
     if (password.length < 8)
@@ -103,7 +126,11 @@ router.post('/register', authLimiter, async (req, res) => {
 
 // ── Login ─────────────────────────────────────────────────────────────────────
 router.post('/login', authLimiter, async (req, res) => {
-    const { email, password } = req.body;
+    const { email, password, recaptchaToken } = req.body;
+
+    const isHuman = await verifyRecaptcha(recaptchaToken);
+    if (!isHuman) return res.status(403).json({ message: 'Falha na verificação de segurança (Bot detectado).' });
+
     if (!email || !password)
         return res.status(400).json({ message: 'E-mail e senha são obrigatórios.' });
 
