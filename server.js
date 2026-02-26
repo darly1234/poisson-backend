@@ -17,6 +17,9 @@ const cookieParser = require('cookie-parser');
 
 const app = express();
 
+// Trust reverse proxy (Apache) for rate limiting and real IP detection
+app.set('trust proxy', 1);
+
 app.use(cors({ origin: process.env.APP_URL || 'http://localhost:3000', credentials: true }));
 app.use(cookieParser());
 app.use(express.json({ limit: '50mb' }));
