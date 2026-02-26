@@ -12,6 +12,9 @@ const crossrefRouter = require('./src/routes/crossref');
 const wordpressRouter = require('./src/routes/wordpress');
 const filesRouter = require('./src/routes/files');
 const uploadsRouter = require('./src/routes/uploads');
+const authRouter = require('./src/routes/auth');
+const { requireAuth } = require('./src/middleware/authMiddleware');
+const cookieParser = require('cookie-parser');
 const path = require('path');
 
 const ANEXOS_PATH = process.env.NODE_ENV === 'production'
