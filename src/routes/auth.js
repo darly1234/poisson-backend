@@ -61,14 +61,32 @@ async function createRefreshToken(userId, res) {
     return token;
 }
 
-function getMailer() {
+async function getMailer() {
+    // Busca SMTP do banco
+    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'smtp_config'");
+    const config = rows[0]?.value;
+
+    if (!config || !config.host || !config.user || !config.pass) {
+        // Fallback para env se não houver config no DB
+        if (!process.env.SMTP_USER) return null;
+        return nodemailer.createTransport({
+            host: process.env.SMTP_HOST || 'smtp.gmail.com',
+            port: parseInt(process.env.SMTP_PORT || '587'),
+            secure: false,
+            auth: {
+                user: process.env.SMTP_USER,
+                pass: process.env.SMTP_PASS,
+            },
+        });
+    }
+
     return nodemailer.createTransport({
-        host: process.env.SMTP_HOST || 'smtp.gmail.com',
-        port: parseInt(process.env.SMTP_PORT || '587'),
-        secure: false,
+        host: config.host,
+        port: parseInt(config.port),
+        secure: parseInt(config.port) === 465,
         auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS,
+            user: config.user,
+            pass: config.pass,
         },
     });
 }
@@ -216,37 +234,52 @@ router.post('/forgot-password', authLimiter, async (req, res) => {
     if (!email) return res.status(400).json({ message: 'E-mail obrigatório.' });
 
     try {
-        const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+        const { rows: userRows } = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
         // Sempre retorna sucesso para não revelar se o email existe
-        if (!rows.length) return res.json({ ok: true });
+        if (!userRows.length) return res.json({ ok: true });
 
         const token = crypto.randomBytes(32).toString('hex');
         const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
 
         await pool.query(
             'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
-            [token, expires, rows[0].id]
+            [token, expires, userRows[0].id]
         );
 
         const resetUrl = `${APP_URL}/reset-password?token=${token}`;
 
-        if (process.env.SMTP_USER) {
-            const mailer = getMailer();
-            await mailer.sendMail({
-                from: `Poisson ERP <${process.env.SMTP_USER}>`,
-                to: email,
+        // Busca SMTP e Templates
+        const { rows: smtpRows } = await pool.query("SELECT value FROM settings WHERE key = 'smtp_config'");
+        const { rows: templateRows } = await pool.query("SELECT value FROM settings WHERE key = 'system_templates'");
+
+        const smtp = smtpRows[0]?.value;
+        const systemTemplates = templateRows[0]?.value;
+
+        const mailer = await getMailer();
+        if (mailer) {
+            const template = systemTemplates?.password_reset || {
                 subject: 'Redefinição de senha — Poisson ERP',
-                html: `
-                    <div style="font-family:sans-serif;max-width:480px;margin:auto">
-                        <h2 style="color:#1F2A8A">Redefinir sua senha</h2>
-                        <p>Clique no botão abaixo para criar uma nova senha. O link expira em <strong>1 hora</strong>.</p>
+                content: 'Olá, clique no link abaixo para redefinir sua senha: {{reset_url}}'
+            };
+
+            const html = `
+                <div style="font-family:sans-serif;max-width:480px;margin:auto">
+                    <h2 style="color:#1F2A8A">${template.subject}</h2>
+                    <p>${template.content.replace('{{reset_url}}', `<a href="${resetUrl}" style="font-weight:bold;color:#1E88E5">clique aqui</a>`)}</p>
+                    <div style="margin: 30px 0;">
                         <a href="${resetUrl}" style="display:inline-block;background:#1E88E5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Redefinir Senha</a>
-                        <p style="color:#999;font-size:12px;margin-top:24px">Se não foi você, ignore este e-mail.</p>
                     </div>
-                `,
+                    <p style="color:#999;font-size:12px;margin-top:24px">Se não foi você, ignore este e-mail.</p>
+                </div>
+            `;
+
+            await mailer.sendMail({
+                from: smtp ? `${smtp.from_name} <${smtp.from_email}>` : `Poisson ERP <${process.env.SMTP_USER}>`,
+                to: email,
+                subject: template.subject,
+                html: html,
             });
         } else {
-            // Sem SMTP configurado: log no console para teste
             console.log(`[auth] Reset URL: ${resetUrl}`);
         }
 
@@ -282,6 +315,85 @@ router.post('/reset-password', async (req, res) => {
         await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [rows[0].id]);
 
         res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ message: `Erro interno: ${err.message}` });
+    }
+});
+
+// ── OTP / Código por E-mail ──────────────────────────────────────────────────
+router.post('/send-otp', authLimiter, async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: 'E-mail obrigatório.' });
+
+    try {
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const expires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutos
+
+        await pool.query(
+            `INSERT INTO users (email, name, otp_code, otp_expires) 
+             VALUES ($1, 'Usuário Poisson', $2, $3)
+             ON CONFLICT (email) DO UPDATE SET otp_code = $2, otp_expires = $3`,
+            [email.toLowerCase(), otp, expires]
+        );
+
+        const { rows: smtpRows } = await pool.query("SELECT value FROM settings WHERE key = 'smtp_config'");
+        const { rows: templateRows } = await pool.query("SELECT value FROM settings WHERE key = 'system_templates'");
+        
+        const smtp = smtpRows[0]?.value;
+        const systemTemplates = templateRows[0]?.value;
+
+        const mailer = await getMailer();
+        if (mailer) {
+            const template = systemTemplates?.login_code || {
+                subject: 'Seu código de acesso — Poisson ERP',
+                content: 'Seu código de acesso é: {{code}}'
+            };
+
+            const html = `
+                <div style="font-family:sans-serif;max-width:480px;margin:auto;text-align:center">
+                    <h2 style="color:#1F2A8A">${template.subject}</h2>
+                    <div style="font-size:32px;font-weight:900;letter-spacing:8px;color:#1E88E5;margin:30px 0;padding:20px;background:#f0f7ff;border-radius:12px">
+                        ${otp}
+                    </div>
+                    <p>${template.content.replace('{{code}}', `<strong>${otp}</strong>`)}</p>
+                    <p style="color:#999;font-size:12px;margin-top:24px">O código expira em 10 minutos.</p>
+                </div>
+            `;
+
+            await mailer.sendMail({
+                from: smtp ? `${smtp.from_name} <${smtp.from_email}>` : `Poisson ERP <${process.env.SMTP_USER}>`,
+                to: email,
+                subject: template.subject,
+                html: html,
+            });
+        }
+
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ message: `Erro interno: ${err.message}` });
+    }
+});
+
+router.post('/verify-otp', authLimiter, async (req, res) => {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ message: 'E-mail e código são obrigatórios.' });
+
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM users WHERE email = $1 AND otp_code = $2 AND otp_expires > NOW()',
+            [email.toLowerCase(), code]
+        );
+        const user = rows[0];
+        if (!user) return res.status(401).json({ message: 'Código inválido ou expirado.' });
+
+        // Limpa OTP após uso
+        await pool.query('UPDATE users SET otp_code = NULL, otp_expires = NULL WHERE id = $1', [user.id]);
+
+        const accessToken = generateAccessToken(user);
+        await createRefreshToken(user.id, res);
+
+        const { password_hash, otp_code, otp_expires, ...safeUser } = user;
+        res.json({ user: safeUser, accessToken });
     } catch (err) {
         res.status(500).json({ message: `Erro interno: ${err.message}` });
     }
