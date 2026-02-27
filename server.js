@@ -12,6 +12,7 @@ const crossrefRouter = require('./src/routes/crossref');
 const wordpressRouter = require('./src/routes/wordpress');
 const filesRouter = require('./src/routes/files');
 const uploadsRouter = require('./src/routes/uploads');
+const webhooksRouter = require('./src/routes/webhooks');
 const authRouter = require('./src/routes/auth');
 const { requireAuth } = require('./src/middleware/authMiddleware');
 const cookieParser = require('cookie-parser');
@@ -48,6 +49,7 @@ app.use('/api/crossref', crossrefRouter);
 app.use('/api/wordpress', wordpressRouter);
 app.use('/api/files', filesRouter);
 app.use('/api/upload', uploadsRouter);
+app.use('/api/webhooks', webhooksRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);
