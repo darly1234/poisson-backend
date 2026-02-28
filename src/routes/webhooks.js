@@ -6,7 +6,7 @@ const fetch = require('node-fetch');
 // ── Mensagens / Envio ─────────────────────────────────────────────────────────
 
 router.post('/send', async (req, res) => {
-    const { recordId, message, templateName } = req.body;
+    const { recordId, subject, message, templateName } = req.body;
 
     if (!recordId || !message) {
         return res.status(400).json({ message: 'RecordID e Mensagem são obrigatórios.' });
@@ -37,6 +37,7 @@ router.post('/send', async (req, res) => {
         const negotiatorPhoneClean = negotiatorPhoneRaw.replace(/\D/g, ''); // Apenas números
 
         const payload = {
+            subject: subject,
             message: message,
             email: negotiatorEmail,
             telefone: negotiatorPhoneClean
@@ -59,7 +60,7 @@ router.post('/send', async (req, res) => {
         // 5. Registrar no log
         await pool.query(
             "INSERT INTO message_logs (record_id, template_name, message_content, status, response_data) VALUES ($1, $2, $3, $4, $5)",
-            [recordId, templateName || 'Personalizada', message, status, JSON.stringify(responseData)]
+            [recordId, templateName || 'Personalizada', `[Assunto: ${subject || 'Sem Assunto'}]\n\n${message}`, status, JSON.stringify(responseData)]
         );
 
         if (response.ok) {
