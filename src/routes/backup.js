@@ -5,6 +5,9 @@ const XLSX = require('xlsx');
 const path = require('path');
 const fs = require('fs');
 const moment = require('moment-timezone');
+const fileUpload = require('express-fileupload');
+
+router.use(fileUpload());
 
 const BACKUPS_DIR = path.join(__dirname, '../../backups');
 const EXPORTS_DIR = path.join(__dirname, '../../exports');

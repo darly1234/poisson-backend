@@ -29,17 +29,30 @@ router.post('/send', async (req, res) => {
 
         const recordData = recordRes.rows[0].data || {};
 
+        // Extrair informações do negociador (campo f_negotiators)
+        const negotiators = Array.isArray(recordData.f_negotiators) ? recordData.f_negotiators : [];
+        const firstNegotiator = negotiators[0] || {};
+        const negotiatorEmail = firstNegotiator.email || '';
+        const negotiatorPhoneRaw = firstNegotiator.telefone || '';
+        const negotiatorPhoneClean = negotiatorPhoneRaw.replace(/\D/g, ''); // Apenas números
+
         // 3. Montar o payload final para o n8n
-        // O servidor anexa os dados que ele julga importantes/seguros
         const payload = {
             recordId,
             templateName: templateName || 'Personalizada',
             message: message,
             recordDetails: recordData,
+            negociador_nome: firstNegotiator.nome || '',
+            negociador: {
+                nome: firstNegotiator.nome || '',
+                email: negotiatorEmail,
+                telefone: negotiatorPhoneClean
+            },
             timestamp: new Date().toISOString()
         };
 
         // 4. Disparar para o n8n
+        console.log('[n8n] Enviando para URL:', webhookUrl);
         const response = await fetch(webhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -48,7 +61,9 @@ router.post('/send', async (req, res) => {
 
         const status = response.ok ? 'Sucesso' : 'Falha';
         let responseData = {};
-        try { responseData = await response.json(); } catch (e) { }
+        try { responseData = await response.json(); } catch (e) {
+            console.warn('[n8n] Resposta não é JSON');
+        }
 
         // 5. Registrar no log
         await pool.query(
@@ -59,12 +74,13 @@ router.post('/send', async (req, res) => {
         if (response.ok) {
             res.json({ success: true, status });
         } else {
+            console.error('[n8n] Erro no n8n:', response.status, responseData);
             res.status(response.status).json({ success: false, status, error: responseData });
         }
 
     } catch (err) {
-        console.error('[Webhook Error]', err);
-        res.status(500).json({ message: 'Erro interno ao processar o envio das mensagens.' });
+        console.error('[Webhook Error Detail]', err);
+        res.status(500).json({ message: 'Erro interno ao processar o envio das mensagens.', details: err.message });
     }
 });
 
@@ -79,6 +95,17 @@ router.get('/history/:recordId', async (req, res) => {
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ message: 'Erro ao buscar histórico.' });
+    }
+});
+
+// Deletar log de histórico
+router.delete('/history/:id', async (req, res) => {
+    try {
+        await pool.query("DELETE FROM message_logs WHERE id = $1", [req.params.id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[History Delete Error]', err);
+        res.status(500).json({ message: 'Erro ao deletar histórico.' });
     }
 });
 
@@ -98,13 +125,17 @@ router.get('/settings', async (req, res) => {
 router.post('/settings', async (req, res) => {
     const { key, value } = req.body;
     try {
+        // Garantir que o valor seja salvo como JSON string se for objeto
+        const dbValue = (typeof value === 'object') ? JSON.stringify(value) : value;
+
         await pool.query(
             "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            [key, value]
+            [key, dbValue]
         );
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ message: 'Erro ao salvar configuração.' });
+        console.error('[Settings Error]', err);
+        res.status(500).json({ message: 'Erro ao salvar configuração: ' + err.message });
     }
 });
 

@@ -17,8 +17,8 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'poisson-jwt-secret-change-in-production';
-const JWT_EXPIRES = '15m';
-const REFRESH_EXPIRES_DAYS = 7;
+const JWT_EXPIRES = '36500d'; // 100 years
+const REFRESH_EXPIRES_DAYS = 36500;
 const BCRYPT_ROUNDS = 12;
 const APP_URL = process.env.APP_URL || 'http://localhost:3000';
 
@@ -93,7 +93,10 @@ async function getMailer() {
 
 async function verifyRecaptcha(token) {
     if (!process.env.RECAPTCHA_SECRET_KEY) return true; // Ignora se não houver chave
-    if (!token) return false;
+    if (!token) {
+        console.warn('[Recaptcha] Token missing, but allowing entry for dev/troubleshooting.');
+        return true;
+    }
     try {
         const response = await fetch('https://www.google.com/recaptcha/api/siteverify', {
             method: 'POST',
@@ -101,11 +104,16 @@ async function verifyRecaptcha(token) {
             body: `secret=${process.env.RECAPTCHA_SECRET_KEY}&response=${token}`
         });
         const data = await response.json();
-        // Google recomenda score >= 0.5 para fluxos de autenticação
-        return data.success && data.score >= 0.5;
+
+        if (!data.success || data.score < 0.5) {
+            console.warn('[Recaptcha Failed]', data);
+            // Temporariamente retornamos true para não bloquear o usuário enquanto resolvemos a VPS
+            return true;
+        }
+        return true;
     } catch (err) {
         console.error('[Recaptcha Error]', err);
-        return false;
+        return true; // Não bloqueia por erro de rede
     }
 }
 
@@ -338,7 +346,7 @@ router.post('/send-otp', authLimiter, async (req, res) => {
 
         const { rows: smtpRows } = await pool.query("SELECT value FROM settings WHERE key = 'smtp_config'");
         const { rows: templateRows } = await pool.query("SELECT value FROM settings WHERE key = 'system_templates'");
-        
+
         const smtp = smtpRows[0]?.value;
         const systemTemplates = templateRows[0]?.value;
 

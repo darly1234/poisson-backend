@@ -2,6 +2,17 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
+const fileUpload = require('express-fileupload');
+
+function normalizeFilename(name) {
+    if (!name) return '';
+    return name
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/ç/g, 'c')
+        .replace(/Ç/g, 'C')
+        .replace(/[^a-zA-Z0-9.\-_]/g, '_');
+}
 
 const ANEXOS_PATH = process.env.NODE_ENV === 'production'
     ? '/var/www/anexos_individuais'
@@ -11,6 +22,8 @@ const ANEXOS_PATH = process.env.NODE_ENV === 'production'
 if (!fs.existsSync(ANEXOS_PATH)) {
     fs.mkdirSync(ANEXOS_PATH, { recursive: true });
 }
+
+router.use(fileUpload());
 
 router.post('/', async (req, res) => {
     if (!req.files || Object.keys(req.files).length === 0) {
@@ -28,7 +41,7 @@ router.post('/', async (req, res) => {
 
     // Padronização do Nome: ID-N_NomeOriginal
     // Removemos caracteres estranhos do nome original para evitar problemas de URL
-    const safeName = file.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+    const safeName = normalizeFilename(file.name);
     const newFileName = `${id}-${nextSeq}_${safeName}`;
     const uploadPath = path.join(ANEXOS_PATH, newFileName);
 
