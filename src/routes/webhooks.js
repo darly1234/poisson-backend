@@ -36,19 +36,10 @@ router.post('/send', async (req, res) => {
         const negotiatorPhoneRaw = firstNegotiator.telefone || '';
         const negotiatorPhoneClean = negotiatorPhoneRaw.replace(/\D/g, ''); // Apenas números
 
-        // 3. Montar o payload final para o n8n
         const payload = {
-            recordId,
-            templateName: templateName || 'Personalizada',
             message: message,
-            recordDetails: recordData,
-            negociador_nome: firstNegotiator.nome || '',
-            negociador: {
-                nome: firstNegotiator.nome || '',
-                email: negotiatorEmail,
-                telefone: negotiatorPhoneClean
-            },
-            timestamp: new Date().toISOString()
+            email: negotiatorEmail,
+            telefone: negotiatorPhoneClean
         };
 
         // 4. Disparar para o n8n
