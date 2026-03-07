@@ -103,9 +103,23 @@ router.get('/list', async (req, res) => {
 
 // POST /api/files/mkdir  { path }
 router.post('/mkdir', async (req, res) => {
-    const fullPath = safePath(req.body.path);
+    const requestedPath = req.body.path || '';
+    const fullPath = safePath(requestedPath);
     try {
-        await withSftp(getSshConfig(req), sftp => sftp.mkdir(fullPath, true));
+        await withSftp(getSshConfig(req), async sftp => {
+            await sftp.mkdir(fullPath, true);
+
+            // Garantir que todas as pastas recursivas a partir da RAIZ recebam chmod 755
+            // para que nenhuma pasta "pai" criada no automático tranque a permissão (ex: adm/Nova/V1)
+            const segments = requestedPath.split('/').filter(Boolean);
+            let currentPath = BASE;
+            for (const seg of segments) {
+                currentPath = path.posix.join(currentPath, seg);
+                try {
+                    await sftp.chmod(currentPath, 0o755);
+                } catch (e) { } // ignora erro se não for o dono ou já tiver
+            }
+        });
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ message: `Erro ao criar pasta: ${err.message}` });
@@ -131,8 +145,11 @@ router.post('/upload', async (req, res) => {
     const destPath = safePath(path.posix.join(req.body.path || '/', normalizeFilename(file.name)));
     console.log(`[Files] Uploading ${file.name} to ${destPath}`);
     try {
-        await withSftp(getSshConfig(req), sftp => sftp.put(file.data, destPath));
-        console.log(`[Files] Upload success: ${destPath}`);
+        await withSftp(getSshConfig(req), async sftp => {
+            await sftp.put(file.data, destPath);
+            await sftp.chmod(destPath, 0o755); // Garante leitura pública
+        });
+        console.log(`[Files] Upload success and chmod 755: ${destPath}`);
         res.json({ ok: true, name: file.name });
     } catch (err) {
         console.error(`[Files] Upload error:`, err.message);

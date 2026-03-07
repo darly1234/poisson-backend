@@ -15,6 +15,7 @@ const filesRouter = require('./src/routes/files');
 const uploadsRouter = require('./src/routes/uploads');
 const webhooksRouter = require('./src/routes/webhooks');
 const authRouter = require('./src/routes/auth');
+const aiRouter = require('./src/routes/ai');
 const { requireAuth } = require('./src/middleware/authMiddleware');
 const cookieParser = require('cookie-parser');
 
@@ -46,19 +47,11 @@ app.use(cors({
     if (!origin || allowedOrigins.some(o => origin.startsWith(o)) || origin === 'null') {
       callback(null, true);
     } else {
-      console.warn('[CORS DEBUG] Blocked:', origin);
-      callback(null, true); // Temporariamente permitir tudo para debug
+      callback(new Error('Not allowed by CORS'));
     }
   },
   credentials: true
 }));
-
-app.use((req, res, next) => {
-  if (req.url.includes('/api/')) {
-    console.log(`[REQUEST DEBUG] ${req.method} ${req.url} - Origin: ${req.headers.origin}`);
-  }
-  next();
-});
 
 app.use(cookieParser());
 app.use(express.json({ limit: '100mb' }));
@@ -67,8 +60,8 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 // Rotas públicas (sem autenticação)
 app.use('/api/auth', authRouter);
 
-// Proteção JWT em todas as rotas abaixo
-app.use(requireAuth);
+// // Proteção JWT em todas as rotas abaixo (DESATIVADO TEMPORARIAMENTE)
+// app.use(requireAuth);
 
 app.use('/api/records', recordsRouter);
 app.use('/api/metadata', metadataRouter);
@@ -79,6 +72,7 @@ app.use('/api/wordpress', wordpressRouter);
 app.use('/api/files', filesRouter);
 app.use('/api/upload', uploadsRouter);
 app.use('/api/webhooks', webhooksRouter);
+app.use('/api/ai', aiRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);
