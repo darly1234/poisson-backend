@@ -2,7 +2,8 @@ const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'poisson-jwt-secret-change-in-production';
 
 function requireAuth(req, res, next) {
-    const auth = req.headers.authorization || (req.query.token ? `Bearer ${req.query.token}` : null);
+    const auth = req.headers.authorization;
+
     if (!auth || !auth.startsWith('Bearer ')) {
         return res.status(401).json({ message: 'Não autorizado.' });
     }
@@ -10,7 +11,7 @@ function requireAuth(req, res, next) {
         const payload = jwt.verify(auth.split(' ')[1], JWT_SECRET);
         req.user = payload;
         next();
-    } catch {
+    } catch (err) {
         return res.status(401).json({ message: 'Token inválido ou expirado.' });
     }
 }

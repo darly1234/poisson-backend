@@ -22,6 +22,8 @@ router.post('/publish', async (req, res) => {
     const base = wpUrl.replace(/\/$/, '');
     const authHeader = 'Basic ' + Buffer.from(`${wpUser}:${wpAppPassword}`).toString('base64');
 
+    console.log(`[wordpress] Target: ${base}, User: ${wpUser}, AuthHeader Start: ${authHeader.substring(0, 15)}...`);
+
     try {
         // ── 1. Upload da capa para a Biblioteca de Mídia ──────────────────────
         let mediaId = null;
@@ -32,7 +34,8 @@ router.post('/publish', async (req, res) => {
             const filename = 'capa.jpg';
             const imgBuffer = Buffer.from(coverBase64.replace(/^data:[^;]+;base64,/, ''), 'base64');
 
-            console.log(`[wordpress] Enviando capa: ${Math.round(imgBuffer.length / 1024)} KB`);
+            console.log(`[wordpress] Enviando capa para: ${base}/wp-json/wp/v2/media`);
+            console.log(`[wordpress] Usuário: ${wpUser}`);
 
             const form = new FormData();
             form.append('file', imgBuffer, { filename, contentType: mimeType });
@@ -42,6 +45,7 @@ router.post('/publish', async (req, res) => {
                 headers: {
                     Authorization: authHeader,
                     'Content-Disposition': `attachment; filename="${filename}"`,
+                    'User-Agent': 'Poisson-ERP/1.0',
                     ...form.getHeaders(),
                 },
                 body: form,
@@ -89,14 +93,15 @@ router.post('/publish', async (req, res) => {
             ? `${base}/wp-json/wc/v3/products/${productId}`
             : `${base}/wp-json/wc/v3/products`;
 
-        console.log(`[wordpress] ${method} produto${productId ? ` ID ${productId}` : ' (novo)'}`);
-        console.log('[wordpress] Produto payload:', JSON.stringify(productPayload, null, 2));
+        console.log(`[wordpress] ${method} produto em: ${productsUrl}`);
+        console.log(`[wordpress] Payload:`, JSON.stringify(productPayload, null, 2));
 
         const productRes = await fetch(productsUrl, {
             method,
             headers: {
                 Authorization: authHeader,
                 'Content-Type': 'application/json',
+                'User-Agent': 'Poisson-ERP/1.0',
             },
             body: JSON.stringify(productPayload),
         });
@@ -123,8 +128,9 @@ router.post('/publish', async (req, res) => {
             });
         } else {
             const errMsg = productData.message || productData.error || JSON.stringify(productData);
+            console.error(`[wordpress] Erro do WordPress API (${productRes.status}):`, errMsg);
             return res.status(productRes.status).json({
-                message: errMsg,
+                message: `Erro no WordPress: ${errMsg}`,
                 code: productData.code || productData.error,
                 coverWarning,
             });

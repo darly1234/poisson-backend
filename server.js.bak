@@ -17,6 +17,7 @@ const webhooksRouter = require('./src/routes/webhooks');
 const authRouter = require('./src/routes/auth');
 const aiRouter = require('./src/routes/ai');
 const mockupAssetsRouter = require('./src/routes/mockup-assets');
+const usersRouter = require('./src/routes/users');
 const { requireAuth } = require('./src/middleware/authMiddleware');
 const cookieParser = require('cookie-parser');
 
@@ -102,6 +103,7 @@ app.use('/api/upload', uploadsRouter);
 app.use('/api/webhooks', webhooksRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/mockups', mockupAssetsRouter);
+app.use('/api/users', usersRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

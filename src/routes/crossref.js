@@ -12,13 +12,15 @@ const CROSSREF_DEPOSIT_URL = 'https://doi.crossref.org/servlet/deposit';
  */
 router.post('/deposit', async (req, res) => {
     const { xmlContent, login_id, login_passwd } = req.body;
+    console.log(`[Crossref] Recebido pedido de depósito. XML length: ${xmlContent?.length || 0}`);
 
     if (!xmlContent || !login_id || !login_passwd) {
+        console.warn('[Crossref] Falha: Dados incompletos facilitados.');
         return res.status(400).json({ message: 'xmlContent, login_id e login_passwd são obrigatórios.' });
     }
 
     try {
-        // Crossref Deposit API usa multipart/form-data com um arquivo XML
+        console.log(`[Crossref] Enviando para Crossref URL: ${CROSSREF_DEPOSIT_URL} com login: ${login_id}`);
         const form = new FormData();
         form.append('operation', 'doMDUpload');
         form.append('login_id', login_id);
@@ -35,29 +37,31 @@ router.post('/deposit', async (req, res) => {
         });
 
         const text = await response.text();
+        console.log(`[Crossref] Resposta recebida. Status: ${response.status}. Corpo (truncado): ${text.slice(0, 100)}`);
 
         if (response.ok) {
-            // Crossref retorna HTML/texto indicando sucesso ou falha
             const isSuccess = text.toLowerCase().includes('your file has been received') ||
                 text.toLowerCase().includes('successfully') ||
                 response.status === 200;
 
             if (isSuccess) {
-                // Tenta extrair ID de submissão do HTML de resposta
                 const idMatch = text.match(/submission_id[=:\s]+([a-zA-Z0-9_-]+)/i);
                 const submission_id = idMatch ? idMatch[1] : `CR-${Date.now()}`;
+                console.log(`[Crossref] Sucesso! Submission ID: ${submission_id}`);
                 return res.json({ ok: true, submission_id, raw: text.slice(0, 500) });
             } else {
+                console.error('[Crossref] Rejeitado pela Crossref:', text);
                 return res.status(422).json({ message: 'Crossref rejeitou o depósito.', raw: text.slice(0, 1000) });
             }
         } else {
+            console.error(`[Crossref] Erro HTTP ${response.status}:`, text);
             return res.status(response.status).json({
                 message: `Crossref retornou status ${response.status}`,
                 raw: text.slice(0, 500)
             });
         }
     } catch (err) {
-        console.error('[crossref/deposit] Erro:', err);
+        console.error('[crossref/deposit] Erro Fatal:', err);
         return res.status(500).json({ message: `Erro interno: ${err.message}` });
     }
 });

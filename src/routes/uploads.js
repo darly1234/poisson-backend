@@ -2,15 +2,32 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
+const fileUpload = require('express-fileupload');
 
-const ANEXOS_PATH = process.env.NODE_ENV === 'production'
-    ? '/var/www/anexos_individuais'
-    : 'C:\\anexos_individuais';
+function normalizeFilename(name) {
+    if (!name) return '';
+    return name
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/ç/g, 'c')
+        .replace(/Ç/g, 'C')
+        .replace(/[^a-zA-Z0-9.\-_]/g, '_');
+}
+
+const ANEXOS_PATH = process.platform === 'win32'
+    ? 'C:\\projeto_poisson_erp\\diversos\\ativos'
+    : '/home/darly/projeto_poisson_erp/diversos/ativos';
 
 // Garante que a pasta existe (redundância de segurança)
-if (!fs.existsSync(ANEXOS_PATH)) {
-    fs.mkdirSync(ANEXOS_PATH, { recursive: true });
+try {
+    if (!fs.existsSync(ANEXOS_PATH)) {
+        fs.mkdirSync(ANEXOS_PATH, { recursive: true });
+    }
+} catch (e) {
+    console.error('Error creating directory:', e);
 }
+
+router.use(fileUpload());
 
 router.post('/', async (req, res) => {
     if (!req.files || Object.keys(req.files).length === 0) {
@@ -28,17 +45,23 @@ router.post('/', async (req, res) => {
 
     // Padronização do Nome: ID-N_NomeOriginal
     // Removemos caracteres estranhos do nome original para evitar problemas de URL
-    const safeName = file.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+    const safeName = normalizeFilename(file.name);
     const newFileName = `${id}-${nextSeq}_${safeName}`;
     const uploadPath = path.join(ANEXOS_PATH, newFileName);
 
     await file.mv(uploadPath);
+    try {
+        fs.chmodSync(uploadPath, 0o755);
+    } catch (e) {
+        console.error('Error setting permissions:', e);
+    }
+
 
     // Retorna a URL pública para o frontend
     res.json({
         success: true,
         name: newFileName,
-        url: `/api/anexos/${newFileName}`
+        url: `/api/anexos/diversos/ativos/${req.files.file.name}`
     });
 });
 
