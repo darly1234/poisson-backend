@@ -15,8 +15,12 @@ const filesRouter = require('./src/routes/files');
 const uploadsRouter = require('./src/routes/uploads');
 const webhooksRouter = require('./src/routes/webhooks');
 const authRouter = require('./src/routes/auth');
+const usersRouter = require('./src/routes/users');
 const aiRouter = require('./src/routes/ai');
+const mediaRouter = require('./src/routes/media');
 const mockupAssetsRouter = require('./src/routes/mockup-assets');
+const notificationsRouter = require('./src/routes/notifications');
+const gfSyncRouter = require('./src/routes/gf-sync');
 const { requireAuth } = require('./src/middleware/authMiddleware');
 const cookieParser = require('cookie-parser');
 
@@ -24,7 +28,7 @@ const ANEXOS_PATH = process.platform === 'win32'
   ? 'C:\\projeto_poisson_erp'
   : '/home/darly/projeto_poisson_erp';
 
-const VERSION = "1.4";
+const VERSION = "v2.93.0";
 
 const app = express();
 
@@ -101,7 +105,11 @@ app.use('/api/files', filesRouter);
 app.use('/api/upload', uploadsRouter);
 app.use('/api/webhooks', webhooksRouter);
 app.use('/api/ai', aiRouter);
+app.use('/api/media', mediaRouter);
+app.use('/api/users', usersRouter);
 app.use('/api/mockups', mockupAssetsRouter);
+app.use('/api/notifications', notificationsRouter);
+app.use('/api/gf-sync', gfSyncRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);
