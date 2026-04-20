@@ -28,7 +28,7 @@ const ANEXOS_PATH = process.platform === 'win32'
   ? 'C:\\projeto_poisson_erp'
   : '/home/darly/projeto_poisson_erp';
 
-const VERSION = "v2.93.5";
+const VERSION = "v2.93.6";
 
 const app = express();
 
