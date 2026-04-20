@@ -48,7 +48,9 @@ router.get('/', requireAuth, async (req, res) => {
 router.get('/summary', requireAuth, async (req, res) => {
   try {
     let query = `
-      SELECT r.id, r.data, r.created_at, r.author_id,
+      SELECT r.id,
+             (r.data - 'wp_description' - 'wp_abstract') AS data,
+             r.created_at, r.author_id,
              u.name as author_name, u.email as author_email, u.role as author_role, u.whatsapp as author_whatsapp, u.orcid as author_orcid
       FROM records r
       LEFT JOIN users u ON r.author_id = u.id
