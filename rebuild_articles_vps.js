@@ -136,20 +136,33 @@ async function main() {
 
     // Copiar arquivos (simplificado)
     const destDir = path.join(ARTIGOS_PATH, recordId);
-    if (fields['10']) {
-      const src = urlToPath(fields['10']);
-      if (src && fs.existsSync(src)) {
-        fs.mkdirSync(destDir, { recursive: true });
-        fs.copyFileSync(src, path.join(destDir, recordId + '_1-' + path.basename(src)));
-        recordData.arquivo_artigo = recordId + '_1-' + path.basename(src);
-      }
-    }
-    if (fields['11']) {
-      const src = urlToPath(fields['11']);
-      if (src && fs.existsSync(src)) {
-        fs.mkdirSync(destDir, { recursive: true });
-        fs.copyFileSync(src, path.join(destDir, recordId + '_2-' + path.basename(src)));
-        recordData.arquivo_cessao = recordId + '_2-' + path.basename(src);
+    
+    const fileFields = [
+      { key: '10', label: '1' },   // Artigo
+      { key: '11', label: '2' },   // Cessão
+      { key: '107', label: '3' },  // Artigo Original
+      { key: '108', label: '4' },  // Dissertação
+      { key: '109', label: '5' },  // Tese
+      { key: '110', label: '6' },  // Monografia
+      { key: '111', label: '7' },  // TCC
+    ];
+
+    for (const f of fileFields) {
+      if (fields[f.key]) {
+        const src = urlToPath(fields[f.key]);
+        if (src && fs.existsSync(src)) {
+          fs.mkdirSync(destDir, { recursive: true });
+          const destName = `${recordId}_${f.label}-${path.basename(src)}`;
+          fs.copyFileSync(src, path.join(destDir, destName));
+          
+          if (f.key === '10') recordData.arquivo_artigo = destName;
+          if (f.key === '11') recordData.arquivo_cessao = destName;
+          if (f.key === '107') recordData.arquivo_original = destName;
+          if (f.key === '108') recordData.arquivo_dissertacao = destName;
+          if (f.key === '109') recordData.arquivo_tese = destName;
+          if (f.key === '110') recordData.arquivo_monografia = destName;
+          if (f.key === '111') recordData.arquivo_tcc = destName;
+        }
       }
     }
 
