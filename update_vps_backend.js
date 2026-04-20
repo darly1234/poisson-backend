@@ -2,7 +2,7 @@ const { Client } = require('ssh2');
 const conn = new Client();
 conn.on('ready', () => {
     console.log('SSH Ready. Updating backend...');
-    conn.exec("cd /var/www/poisson-backend && git stash && git pull origin main && npm install && pm2 restart poisson-api", (err, stream) => {
+    conn.exec("cd /var/www/poisson-backend && git stash && git pull origin main && npm install && pm2 restart poisson-backend", (err, stream) => {
         let out = '';
         stream.on('close', () => {
             console.log('Output from VPS:');

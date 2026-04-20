@@ -20,13 +20,13 @@ router.post('/', async (req, res) => {
   if (existing.rows.length === 0) {
     const result = await pool.query(
       'INSERT INTO metadata (tabs, fieldBank) VALUES ($1, $2) RETURNING *',
-      [tabs || [], fieldBank || []]
+      [JSON.stringify(tabs || []), JSON.stringify(fieldBank || [])]
     );
     res.json(result.rows[0]);
   } else {
     const result = await pool.query(
       'UPDATE metadata SET tabs = $1, fieldBank = $2, updated_at = NOW() WHERE id = $3 RETURNING *',
-      [tabs || [], fieldBank || [], existing.rows[0].id]
+      [JSON.stringify(tabs || []), JSON.stringify(fieldBank || []), existing.rows[0].id]
     );
     res.json(result.rows[0]);
   }

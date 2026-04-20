@@ -1,8 +1,64 @@
 const express = require('express');
 const https = require('https');
+const http = require('http'); // Adicionado para Ollama local
 const router = express.Router();
 const pool = require('../db');
 const { decrypt } = require('../utils/crypto');
+
+function makeLocalRequest(options, bodyParams) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(bodyParams);
+        options.headers = {
+            ...options.headers,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body)
+        };
+
+        const req = http.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    const json = JSON.parse(data);
+                    resolve({ status: res.statusCode, json });
+                } catch (e) {
+                    reject(new Error('Resposta inválida do Ollama: ' + data.substring(0, 100)));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+
+function ollamaRequest(prompt, timeoutMs = 60000) {
+    const options = {
+        hostname: 'localhost',
+        port: 11434,
+        path: '/api/generate',
+        method: 'POST',
+        headers: {}
+    };
+    // Trunca prompt para 6000 chars para caber no num_ctx
+    const truncated = prompt.length > 6000 ? prompt.substring(0, 6000) + '\n[TEXTO TRUNCADO]' : prompt;
+    const body = {
+        model: 'llama3.2',
+        prompt: truncated,
+        stream: false,
+        keep_alive: '30m',
+        options: {
+            temperature: 0.2,
+            num_predict: 800,
+            num_ctx: 8192,
+            num_thread: 8,
+        }
+    };
+    return Promise.race([
+        makeLocalRequest(options, body),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Ollama timeout após ' + timeoutMs + 'ms')), timeoutMs))
+    ]);
+}
 
 function makeRequest(options, bodyParams) {
     return new Promise((resolve, reject) => {
@@ -202,7 +258,15 @@ async function getApiKeyFromSettings(key) {
             }
 
             if (typeof val === 'string' && val.includes(':')) {
-                return decrypt(val);
+                val = decrypt(val);
+                // Após decrypt pode vir {"key":"..."} — faz segundo parse
+                if (typeof val === 'string' && val.trim().startsWith('{')) {
+                    try {
+                        const inner = JSON.parse(val);
+                        if (inner.key) return inner.key;
+                    } catch(e) {}
+                }
+                return val;
             }
             return (typeof val === 'string') ? val : null;
         }
@@ -1638,90 +1702,143 @@ async function queryDatabaseContext(question) {
     const results = [];
 
     try {
-        // Detecta se pergunta é sobre dados específicos
-        const isAboutData = /autor|livro|artigo|coletân|publicaç|isbn|doi|título|titulo|quem|quantos|lista|encontr|busca|pesquisa|existe|tem algum|há algum/i.test(question);
-        if (!isAboutData) return '';
-
-        // Extrai termos de busca relevantes (remove stopwords)
-        const stopwords = /^(o|a|os|as|de|da|do|das|dos|em|no|na|nos|nas|que|qual|quais|como|onde|quando|é|para|por|com|um|uma|uns|umas|me|meu|minha|sobre|algum|alguma|tem|há|existe|isso|este|esta|esse|essa)$/i;
-        const terms = question
-            .replace(/[?!.,;:]/g, '')
-            .split(/\s+/)
-            .filter(t => t.length > 2 && !stopwords.test(t));
-
-        if (terms.length === 0) return '';
-
-        const searchPattern = terms.join(' & ');
-
-        // Busca em livros/coletâneas (records com id I- ou C-)
-        const livros = await pool.query(`
+        // === CATÁLOGO COMPLETO (sempre injetado) ===
+        const allLivros = await pool.query(`
             SELECT id,
                    data->>'titulo' as titulo,
                    data->>'status' as status,
                    data->>'doi' as doi,
+                   data->>'isbn' as isbn,
                    data->>'ano' as ano,
                    data->>'tipo' as tipo,
-                   data->'autores' as autores
+                   data->'autores' as autores,
+                   data->>'f_negotiators' as negotiators_raw,
+                   data->'f_negotiators' as negotiators
             FROM records
             WHERE (id LIKE 'I-%' OR id LIKE 'C-%')
-              AND (
-                  to_tsvector('portuguese', COALESCE(data->>'titulo','') || ' ' || COALESCE(data->>'autores_texto',''))
-                  @@ to_tsquery('portuguese', $1)
-                  OR data::text ILIKE ANY(ARRAY[${terms.map((_, i) => `$${i+2}`).join(',')}])
-              )
-            LIMIT 5
-        `, [searchPattern, ...terms.map(t => `%${t}%`)]);
+            ORDER BY id
+        `);
 
-        if (livros.rows.length > 0) {
-            results.push('=== LIVROS/COLETÂNEAS ENCONTRADOS ===');
-            livros.rows.forEach(r => {
+        if (allLivros.rows.length > 0) {
+            results.push('=== CATÁLOGO COMPLETO DE LIVROS/COLETÂNEAS ===');
+            allLivros.rows.forEach(r => {
                 let autores = '';
                 try {
                     const arr = typeof r.autores === 'string' ? JSON.parse(r.autores) : r.autores;
                     if (Array.isArray(arr)) autores = arr.map(a => a.nome || a.name || a).filter(Boolean).join(', ');
                 } catch(e) {}
-                results.push(`ID: ${r.id} | Título: ${r.titulo || '(sem título)'} | Status: ${r.status || '-'} | Ano: ${r.ano || '-'} | DOI: ${r.doi || '-'}${autores ? ' | Autores: ' + autores : ''}`);
+                let negs = '';
+                try {
+                    const arr = typeof r.negotiators === 'string' ? JSON.parse(r.negotiators) : r.negotiators;
+                    if (Array.isArray(arr)) negs = arr.map(n => `${n.nome || ''}<${n.email || ''}>`).filter(Boolean).join(', ');
+                } catch(e) {}
+                const line = [
+                    `ID: ${r.id}`,
+                    `Título: ${r.titulo || '(sem título)'}`,
+                    `Tipo: ${r.tipo || '-'}`,
+                    `Status: ${r.status || '-'}`,
+                    `Ano: ${r.ano || '-'}`,
+                    r.isbn ? `ISBN: ${r.isbn}` : null,
+                    r.doi ? `DOI: ${r.doi}` : null,
+                    autores ? `Autores: ${autores}` : null,
+                    negs ? `Negociadores: ${negs}` : null,
+                ].filter(Boolean).join(' | ');
+                results.push(line);
             });
         }
 
-        // Busca em artigos (records com id A-)
-        const artigos = await pool.query(`
+        // === CATÁLOGO COMPLETO DE ARTIGOS ===
+        const allArtigos = await pool.query(`
             SELECT id,
                    data->>'titulo' as titulo,
                    data->>'titulo_artigo' as titulo_artigo,
                    data->>'status_publicacao' as status,
                    data->'nomes' as autores,
-                   data->>'livro' as livro
+                   data->>'livro' as livro,
+                   data->>'doi' as doi
             FROM records
             WHERE id LIKE 'A-%'
-              AND data::text ILIKE ANY(ARRAY[${terms.map((_, i) => `$${i+1}`).join(',')}])
-            LIMIT 5
-        `, terms.map(t => `%${t}%`));
+            ORDER BY id
+        `);
 
-        if (artigos.rows.length > 0) {
-            results.push('=== ARTIGOS ENCONTRADOS ===');
-            artigos.rows.forEach(r => {
+        if (allArtigos.rows.length > 0) {
+            results.push('=== CATÁLOGO COMPLETO DE ARTIGOS ===');
+            allArtigos.rows.forEach(r => {
                 const titulo = r.titulo_artigo || r.titulo || '(sem título)';
                 let autores = '';
                 try {
                     const arr = typeof r.autores === 'string' ? JSON.parse(r.autores) : r.autores;
                     if (Array.isArray(arr)) autores = arr.join(', ');
                 } catch(e) {}
-                results.push(`ID: ${r.id} | Título: ${titulo} | Status: ${r.status || '-'} | Livro: ${r.livro || '-'}${autores ? ' | Autores: ' + autores : ''}`);
+                const line = [
+                    `ID: ${r.id}`,
+                    `Título: ${titulo}`,
+                    `Status: ${r.status || '-'}`,
+                    `Livro: ${r.livro || '-'}`,
+                    r.doi ? `DOI: ${r.doi}` : null,
+                    autores ? `Autores: ${autores}` : null,
+                ].filter(Boolean).join(' | ');
+                results.push(line);
             });
         }
 
-        // Se pergunta sobre contagens
-        if (/quantos|total|quantidade/i.test(question)) {
-            const counts = await pool.query(`
-                SELECT
-                    COUNT(*) FILTER (WHERE id LIKE 'I-%') as individuais,
-                    COUNT(*) FILTER (WHERE id LIKE 'C-%') as coletaneas,
-                    COUNT(*) FILTER (WHERE id LIKE 'A-%') as artigos
+        // === TOTAIS ===
+        const counts = await pool.query(`
+            SELECT
+                COUNT(*) FILTER (WHERE id LIKE 'I-%') as individuais,
+                COUNT(*) FILTER (WHERE id LIKE 'C-%') as coletaneas,
+                COUNT(*) FILTER (WHERE id LIKE 'A-%') as artigos
+            FROM records
+        `);
+        const c = counts.rows[0];
+        results.push(`=== TOTAIS NO BANCO ===\nLivros individuais: ${c.individuais} | Coletâneas: ${c.coletaneas} | Artigos: ${c.artigos}`);
+
+        // === BUSCA DETALHADA POR PALAVRAS-CHAVE (complementar) ===
+        const stopwords = /^(o|a|os|as|de|da|do|das|dos|em|no|na|nos|nas|que|qual|quais|como|onde|quando|é|para|por|com|um|uma|uns|umas|me|meu|minha|sobre|algum|alguma|tem|há|existe|isso|este|esta|esse|essa)$/i;
+        const terms = question
+            .replace(/[?!.,;:]/g, '')
+            .split(/\s+/)
+            .filter(t => t.length > 2 && !stopwords.test(t));
+
+        if (terms.length > 0) {
+            const searchPattern = terms.join(' & ');
+
+            const livrosDetalhe = await pool.query(`
+                SELECT id,
+                       data->>'titulo' as titulo,
+                       data->>'autores_texto' as autores_texto,
+                       data->>'endereco' as endereco,
+                       data->>'cidade' as cidade,
+                       data->>'pais' as pais,
+                       data->>'edicao' as edicao,
+                       data->>'paginas' as paginas,
+                       data->>'idioma' as idioma,
+                       data->>'area' as area
                 FROM records
-            `);
-            const c = counts.rows[0];
-            results.push(`=== TOTAIS NO BANCO ===\nLivros individuais: ${c.individuais} | Coletâneas: ${c.coletaneas} | Artigos: ${c.artigos}`);
+                WHERE (id LIKE 'I-%' OR id LIKE 'C-%')
+                  AND (
+                      to_tsvector('portuguese', COALESCE(data->>'titulo','') || ' ' || COALESCE(data->>'autores_texto','') || ' ' || COALESCE(data->>'area',''))
+                      @@ to_tsquery('portuguese', $1)
+                      OR data::text ILIKE ANY(ARRAY[${terms.map((_, i) => `$${i+2}`).join(',')}])
+                  )
+                LIMIT 3
+            `, [searchPattern, ...terms.map(t => `%${t}%`)]);
+
+            if (livrosDetalhe.rows.length > 0) {
+                results.push('=== DETALHES ADICIONAIS (busca por termo) ===');
+                livrosDetalhe.rows.forEach(r => {
+                    const extra = [
+                        r.endereco ? `Endereço: ${r.endereco}` : null,
+                        r.cidade ? `Cidade: ${r.cidade}` : null,
+                        r.pais ? `País: ${r.pais}` : null,
+                        r.edicao ? `Edição: ${r.edicao}` : null,
+                        r.paginas ? `Páginas: ${r.paginas}` : null,
+                        r.idioma ? `Idioma: ${r.idioma}` : null,
+                        r.area ? `Área: ${r.area}` : null,
+                    ].filter(Boolean).join(' | ');
+                    if (extra) results.push(`ID: ${r.id} | ${r.titulo || ''} — ${extra}`);
+                });
+            }
         }
 
     } catch(e) {
@@ -1794,7 +1911,7 @@ ${SYSTEM_HELP_MANUAL.substring(0, 8000)}${dbSection}`;
                 };
                 const { status, json } = await makeRequest(geminiOptions, geminiBody);
                 if (status >= 200 && status < 300 && json.candidates?.[0]?.content?.parts?.[0]?.text) {
-                    return res.json({ text: json.candidates[0].content.parts[0].text, provider: 'gemini' });
+                    return res.json({ text: json.candidates[0].content.parts[0].text, provider: 'Gemini · gemini-2.0-flash' });
                 }
                 errors.push('Gemini:' + status + ':' + JSON.stringify(json.error || json).substring(0, 120));
             } catch(e) { errors.push('Gemini:exc:' + e.message); }
@@ -1821,7 +1938,7 @@ ${SYSTEM_HELP_MANUAL.substring(0, 8000)}${dbSection}`;
                 };
                 const { status, json } = await makeRequest(orOptions, orBody);
                 if (status >= 200 && status < 300 && json.choices?.[0]?.message?.content) {
-                    return res.json({ text: json.choices[0].message.content, provider: 'openrouter' });
+                    return res.json({ text: json.choices[0].message.content, provider: 'OpenRouter · gemini-2.0-flash' });
                 }
                 errors.push('OpenRouter:' + status + ':' + JSON.stringify(json.error || json).substring(0, 120));
             } catch(e) { errors.push('OpenRouter:exc:' + e.message); }
@@ -1844,7 +1961,7 @@ ${SYSTEM_HELP_MANUAL.substring(0, 8000)}${dbSection}`;
                 };
                 const { status, json } = await makeRequest(groqOptions, groqBody);
                 if (status >= 200 && status < 300 && json.choices?.[0]?.message?.content) {
-                    return res.json({ text: json.choices[0].message.content, provider: 'groq' });
+                    return res.json({ text: json.choices[0].message.content, provider: 'Groq · llama-3.3-70b' });
                 }
                 errors.push('Groq:' + status + ':' + JSON.stringify(json.error || json).substring(0, 120));
             } catch(e) { errors.push('Groq:exc:' + e.message); }
@@ -1857,5 +1974,584 @@ ${SYSTEM_HELP_MANUAL.substring(0, 8000)}${dbSection}`;
     }
 });
 
-module.exports = router;
+/* ─── Avaliação de Artigo via extração de texto + Gemini ─────────────────── */
+router.post('/avaliar-artigo', async (req, res) => {
+    const { record_id, filename } = req.body;
+    if (!record_id || !filename) {
+        return res.status(400).json({ error: 'record_id e filename são obrigatórios.' });
+    }
 
+    let geminiKey = await getApiKeyFromSettings('gemini_api_key');
+    if (!geminiKey) geminiKey = await getApiKeyFromSettings('gemini_key');
+    let openrouterKey = await getApiKeyFromSettings('openrouter_api_key');
+    if (!openrouterKey) openrouterKey = await getApiKeyFromSettings('openrouter_key');
+    let groqKey = await getApiKeyFromSettings('groq_api_key');
+    if (!groqKey) groqKey = await getApiKeyFromSettings('groq_key');
+
+    if (!geminiKey && !openrouterKey && !groqKey) {
+        return res.status(400).json({ error: 'Nenhuma API Key configurada em Configurações → Chaves.' });
+    }
+
+    const BASE_PATH = process.platform === 'win32'
+        ? 'C:\\projeto_poisson_erp'
+        : '/home/darly/projeto_poisson_erp';
+
+    const subfolder = record_id.startsWith('A-') ? 'artigos' : record_id.startsWith('I-') || record_id.startsWith('C-') ? 'livros' : 'diversos';
+    const filePath = require('path').join(BASE_PATH, subfolder, record_id, filename);
+
+    if (!require('fs').existsSync(filePath)) {
+        const dir = require('path').join(BASE_PATH, subfolder, record_id);
+        let available = [];
+        try { available = require('fs').readdirSync(dir); } catch(e) {}
+        return res.status(404).json({ error: 'Arquivo não encontrado no servidor.', available });
+    }
+
+    try {
+        const ext = filename.split('.').pop().toLowerCase();
+        let textoArtigo = '';
+
+        if (ext === 'docx' || ext === 'doc') {
+            const mammoth = require('mammoth');
+            const { value } = await mammoth.extractRawText({ path: filePath });
+            textoArtigo = value.substring(0, 30000);
+        } else {
+            textoArtigo = require('fs').readFileSync(filePath, 'utf8').substring(0, 30000);
+        }
+
+        if (!textoArtigo || textoArtigo.trim().length < 100) {
+            return res.status(400).json({ error: 'Não foi possível extrair texto do arquivo.' });
+        }
+
+        console.log('[Avaliação] Texto extraído:', textoArtigo.length, 'chars');
+        const prompt = await buildAvaliacaoPrompt(textoArtigo);
+        const result = await avaliacaoLLM(prompt, geminiKey, openrouterKey, groqKey);
+        return res.json(result);
+
+    } catch (err) {
+        console.error('[Avaliação] Erro:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+const PROMPT_ARTIGO_DEFAULT = `Atue como avaliador acadêmico sênior. Analise o artigo a seguir.
+
+TEXTO DO ARTIGO:
+{{textoArtigo}}
+
+Critérios (0 a 10 cada):
+1. Pertinência e Originalidade
+2. Consistência Teórica/Conceitual
+3. Clareza e Estrutura
+4. Qualidade Metodológica ou do Relato
+5. Resultados e Contribuições
+
+Regra: Média > 6.0 = APROVADO, ≤ 6.0 = REPROVADO.
+
+Responda SOMENTE com JSON válido, sem markdown, sem texto fora do JSON:
+{"status":"APROVADO ou REPROVADO","nota_final":0.0,"criterios":[{"nome":"Pertinência e Originalidade","nota":0},{"nome":"Consistência Teórica/Conceitual","nota":0},{"nome":"Clareza e Estrutura","nota":0},{"nome":"Qualidade Metodológica ou do Relato","nota":0},{"nome":"Resultados e Contribuições","nota":0}],"pontos_fortes":["ponto1","ponto2","ponto3"],"pontos_melhoria":["melhoria1","melhoria2"],"veredito":"justificativa"}`;
+
+async function buildAvaliacaoPrompt(texto) {
+    const template = await getPromptTemplate('prompt_artigo', PROMPT_ARTIGO_DEFAULT);
+    return applyTemplate(template, { textoArtigo: texto || '' });
+}
+
+async function avaliacaoLLM(prompt, geminiKey, openrouterKey, groqKey) {
+    const errors = [];
+
+    // 1. GROQ (rápido, gratuito)
+    if (groqKey) {
+        try {
+            const result = await groqAvaliacao(groqKey, prompt);
+            console.log('[Avaliação] Groq OK');
+            return { ...result, _provider: 'Groq · llama-3.3-70b' };
+        } catch(e) { errors.push('Groq: ' + e.message); console.log('[Avaliação] Groq falhou:', e.message); }
+    }
+
+    // 2. OpenRouter
+    if (openrouterKey) {
+        try {
+            const result = await openrouterAvaliacao(openrouterKey, prompt);
+            console.log('[Avaliação] OpenRouter OK');
+            return { ...result, _provider: 'OpenRouter · llama-3.3-70b' };
+        } catch(e) { errors.push('OpenRouter: ' + e.message); console.log('[Avaliação] OpenRouter falhou:', e.message); }
+    }
+
+    // 3. Gemini
+    if (geminiKey) {
+        try {
+            const body = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
+            const raw = await geminiGenerateRaw(geminiKey, body);
+            const result = parseAvaliacaoJSON(raw);
+            console.log('[Avaliação] Gemini OK');
+            return { ...result, _provider: 'Gemini' };
+        } catch(e) { errors.push('Gemini: ' + e.message); }
+    }
+
+    // 4. Ollama local (último recurso — CPU, lento)
+    try {
+        console.log('[Avaliação] Tentando Ollama Local (fallback)...');
+        const res = await ollamaRequest(prompt);
+        if (res.status === 200 && res.json?.response) {
+            console.log('[Avaliação] Ollama OK');
+            return { ...parseAvaliacaoJSON(res.json.response), _provider: 'Ollama · llama3.2 (local)' };
+        }
+        throw new Error('Ollama status ' + res.status);
+    } catch(e) { errors.push('Ollama: ' + e.message); }
+
+    throw new Error('Todos os provedores falharam: ' + errors.join(' | '));
+}
+
+async function openrouterAvaliacao(apiKey, prompt) {
+    const body = JSON.stringify({
+        model: 'meta-llama/llama-3.3-70b-instruct:free',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 1500,
+        temperature: 0.3
+    });
+    const response = await new Promise((resolve, reject) => {
+        const options = {
+            hostname: 'openrouter.ai',
+            path: '/api/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'HTTP-Referer': 'https://poisson.com.br',
+                'X-Title': 'Poisson ERP',
+                'Content-Length': Buffer.byteLength(body)
+            },
+            timeout: 120000
+        };
+        const req2 = require('https').request(options, (r) => {
+            let data = '';
+            r.on('data', c => data += c);
+            r.on('end', () => resolve({ status: r.statusCode, body: data }));
+        });
+        req2.on('error', reject);
+        req2.write(body);
+        req2.end();
+    });
+    if (response.status !== 200) {
+        const err = JSON.parse(response.body || '{}');
+        throw new Error(err?.error?.message || response.status);
+    }
+    const data = JSON.parse(response.body);
+    const raw = data.choices?.[0]?.message?.content || '';
+    return parseAvaliacaoJSON(raw);
+}
+
+async function groqAvaliacao(apiKey, prompt) {
+    const body = JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 1500,
+        temperature: 0.3
+    });
+    const response = await new Promise((resolve, reject) => {
+        const options = {
+            hostname: 'api.groq.com',
+            path: '/openai/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Length': Buffer.byteLength(body)
+            },
+            timeout: 60000
+        };
+        const req2 = require('https').request(options, (r) => {
+            let data = '';
+            r.on('data', c => data += c);
+            r.on('end', () => resolve({ status: r.statusCode, body: data }));
+        });
+        req2.on('error', reject);
+        req2.write(body);
+        req2.end();
+    });
+    if (response.status !== 200) {
+        const err = JSON.parse(response.body || '{}');
+        throw new Error(err?.error?.message || response.status);
+    }
+    const data = JSON.parse(response.body);
+    const raw = data.choices?.[0]?.message?.content || '';
+    return parseAvaliacaoJSON(raw);
+}
+
+async function geminiGenerateRaw(geminiKey, body) {
+    // Confirmed working models for text generation in v1beta
+    const models = [
+        'gemini-2.0-flash',
+        'gemini-2.0-flash-lite', 
+        'gemini-1.5-flash',
+        'gemini-1.5-flash-001',
+    ];
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const allErrors = [];
+
+    const tryModel = async (model, attempt = 0) => {
+        const path = `/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+        const genResponse = await new Promise((resolve, reject) => {
+            const options = {
+                hostname: 'generativelanguage.googleapis.com',
+                path,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+                timeout: 90000
+            };
+            const req2 = require('https').request(options, (r) => {
+                let data = '';
+                r.on('data', c => data += c);
+                r.on('end', () => resolve({ status: r.statusCode, body: data }));
+            });
+            req2.on('error', reject);
+            req2.write(body);
+            req2.end();
+        });
+
+        if (genResponse.status === 200) {
+            const genData = JSON.parse(genResponse.body);
+            const raw = genData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            console.log(`[Gemini] OK: ${model} (attempt ${attempt + 1})`);
+            return raw;
+        }
+
+        // Rate limit (429) — extract retry delay and wait if we have attempts left
+        if (genResponse.status === 429 && attempt < 3) {
+            let retryMs = 15000; // default 15s
+            try {
+                const errBody = JSON.parse(genResponse.body || '{}');
+                const retryStr = errBody?.error?.message?.match(/retry in ([\\d.]+)s/i)?.[1];
+                if (retryStr) retryMs = Math.ceil(parseFloat(retryStr) * 1000) + 2000;
+            } catch(e) {}
+            console.log(`[Gemini] ${model} rate limited. Waiting ${retryMs}ms then retrying (attempt ${attempt + 2}/4)...`);
+            await sleep(retryMs);
+            return tryModel(model, attempt + 1);
+        }
+
+        let errMsg = String(genResponse.status);
+        try { errMsg = JSON.parse(genResponse.body)?.error?.message || errMsg; } catch(e) {}
+        // Truncate long error messages
+        if (errMsg.length > 150) errMsg = errMsg.substring(0, 150) + '...';
+        throw new Error(`${model}: ${errMsg}`);
+    };
+
+    for (const model of models) {
+        try {
+            return await tryModel(model);
+        } catch(e) {
+            allErrors.push(e.message);
+            console.log(`[Gemini] ${model} falhou definitivamente:`, e.message.substring(0, 100));
+        }
+    }
+    throw new Error(allErrors.join(' | '));
+}
+
+function parseAvaliacaoJSON(raw) {
+    console.log('[Avaliação] raw (200 chars):', raw.substring(0, 200));
+    let jsonStr = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonMatch) jsonStr = jsonMatch[0];
+    return JSON.parse(jsonStr);
+}
+
+// ── Avaliação do Termo de Cessão por IA ──────────────────────────────────────
+router.post('/avaliar-termo', async (req, res) => {
+    const { record_id, filename, autores, titulo } = req.body;
+    if (!record_id || !filename) {
+        return res.status(400).json({ error: 'record_id e filename são obrigatórios.' });
+    }
+
+    let geminiKey = await getApiKeyFromSettings('gemini_api_key');
+    if (!geminiKey) geminiKey = await getApiKeyFromSettings('gemini_key');
+    let openrouterKey = await getApiKeyFromSettings('openrouter_api_key');
+    if (!openrouterKey) openrouterKey = await getApiKeyFromSettings('openrouter_key');
+    let groqKey = await getApiKeyFromSettings('groq_api_key');
+    if (!groqKey) groqKey = await getApiKeyFromSettings('groq_key');
+
+    if (!geminiKey && !openrouterKey && !groqKey) {
+        return res.status(400).json({ error: 'Nenhuma API Key configurada em Configurações → Chaves.' });
+    }
+
+    const BASE_PATH = process.platform === 'win32'
+        ? 'C:\\projeto_poisson_erp'
+        : '/home/darly/projeto_poisson_erp';
+
+    const subfolder = record_id.startsWith('A-') ? 'artigos' : (record_id.startsWith('I-') || record_id.startsWith('C-')) ? 'livros' : 'diversos';
+    const filePath = require('path').join(BASE_PATH, subfolder, record_id, filename);
+
+    if (!require('fs').existsSync(filePath)) {
+        const dir = require('path').join(BASE_PATH, subfolder, record_id);
+        let available = [];
+        try { available = require('fs').readdirSync(dir); } catch(e) {}
+        return res.status(404).json({ error: 'Arquivo do Termo de Cessão não encontrado no servidor.', available });
+    }
+
+    try {
+        const ext = filename.split('.').pop().toLowerCase();
+        let textoTermo = '';
+
+        if (ext === 'docx' || ext === 'doc') {
+            const mammoth = require('mammoth');
+            const { value } = await mammoth.extractRawText({ path: filePath });
+            textoTermo = value.substring(0, 30000);
+        } else if (ext === 'pdf') {
+            try {
+                const { execSync } = require('child_process');
+                // -layout preserva melhor o posicionamento; tenta também com -annot para capturar anotações
+                let raw = '';
+                try {
+                    raw = execSync(`pdftotext -enc UTF-8 -layout "${filePath}" -`, { maxBuffer: 10 * 1024 * 1024 }).toString();
+                } catch(e) {
+                    raw = execSync(`pdftotext -enc UTF-8 "${filePath}" -`, { maxBuffer: 10 * 1024 * 1024 }).toString();
+                }
+                textoTermo = raw.substring(0, 30000);
+                console.log('[Termo] PDF extraído:', textoTermo.length, 'chars. Amostra:', textoTermo.substring(0, 500));
+            } catch(pdfErr) {
+                console.error('[Termo] pdftotext erro:', pdfErr.message);
+                return res.status(400).json({ error: 'Não foi possível extrair texto do PDF: ' + pdfErr.message });
+            }
+        } else {
+            textoTermo = require('fs').readFileSync(filePath, 'utf8').substring(0, 30000);
+        }
+
+        if (!textoTermo || textoTermo.trim().length < 50) {
+            return res.status(400).json({ error: 'Não foi possível extrair texto do arquivo do Termo.' });
+        }
+
+        console.log('[Termo] Texto extraído:', textoTermo.length, 'chars');
+        const prompt = await buildTermoPrompt(textoTermo, autores || [], titulo || '');
+        const result = await termoLLM(prompt, geminiKey, openrouterKey, groqKey);
+        return res.json(result);
+
+    } catch (err) {
+        console.error('[Termo] Erro:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+function detectGovBrSignatures(texto) {
+    const found = [];
+    // Padrão: bloco contendo "iti.gov.br" perto de um nome em maiúsculas e uma data
+    const lines = texto.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        // Detecta URL de validação gov.br
+        if (/validar\.iti\.gov\.br|iti\.gov\.br/i.test(line)) {
+            // Procura nome em maiúsculas nas linhas vizinhas (janela de ±5 linhas)
+            for (let j = Math.max(0, i - 5); j <= Math.min(lines.length - 1, i + 5); j++) {
+                const l = lines[j].trim();
+                // Nome em maiúsculas: pelo menos 2 palavras, só letras acentuadas/espaço
+                if (/^[A-ZÁÉÍÓÚÀÃÕÂÊÔÜÇ]{2,}(\s[A-ZÁÉÍÓÚÀÃÕÂÊÔÜÇ]{2,})+$/.test(l)) {
+                    // Busca data próxima
+                    const ctx = lines.slice(Math.max(0, i - 5), Math.min(lines.length, i + 5)).join(' ');
+                    const dateMatch = ctx.match(/Data:\s*(\d{2}\/\d{2}\/\d{4}[^\s]*)/i);
+                    found.push({ nome: l, data: dateMatch ? dateMatch[1] : null });
+                    break;
+                }
+            }
+        }
+        // Padrão alternativo: "Documento assinado digitalmente" + nome caps na linha seguinte
+        if (/documento assinado digitalmente/i.test(line) && i + 1 < lines.length) {
+            const next = lines[i + 1].trim();
+            if (/^[A-ZÁÉÍÓÚÀÃÕÂÊÔÜÇ]{2,}(\s[A-ZÁÉÍÓÚÀÃÕÂÊÔÜÇ]{2,})+$/.test(next)) {
+                if (!found.find(f => f.nome === next)) {
+                    found.push({ nome: next, data: null });
+                }
+            }
+        }
+    }
+    return found;
+}
+
+const PROMPT_TERMO_DEFAULT = `Você é um agente de conformidade da Editora Poisson. Valide se o Termo de Cessão está apto para publicação.
+
+REGRAS FUNDAMENTAIS:
+- Assinatura MANUAL e assinatura DIGITAL (gov.br/ICP-Brasil) são igualmente válidas. Não há distinção de validade entre os dois tipos.
+- IGNORE completamente assinaturas de pessoas que NÃO estão na lista de autores cadastrados. Isso não é problema.
+- Verifique SOMENTE se cada autor CADASTRADO possui qualquer assinatura no termo (manual ou digital).
+{{govbrBloco}}
+AUTORES CADASTRADOS:
+{{autoresList}}
+
+TÍTULO NO CADASTRO: {{titulo}}
+
+TEXTO DO TERMO:
+{{textoTermo}}
+
+INSTRUÇÕES:
+
+1. ASSINATURAS: Para cada autor cadastrado, busque qualquer assinatura (manual ou digital). Use correspondência flexível de nomes (ignore acentos, maiúsculas, abreviações). Se o bloco gov.br acima indicar o autor, marque como assinado.
+
+2. TÍTULO: Compare com o cadastrado. Similaridade mínima de 95%. Ignore maiúsculas e pontuação.
+
+3. VEREDITO OBRIGATÓRIO:
+- "TERMO COMPLETO": TODOS os autores cadastrados assinaram E título compatível.
+- "TERMO INCOMPLETO": Qualquer autor cadastrado sem assinatura OU título incompatível.
+- Em caso de dúvida, use "TERMO INCOMPLETO".
+
+Responda SOMENTE com JSON válido, sem markdown, sem texto fora do JSON:
+{"veredito":"TERMO COMPLETO ou TERMO INCOMPLETO","titulo_no_termo":"título encontrado","titulo_cadastro":"{{titulo}}","titulo_ok":true,"autores":[{"nome":"Nome","status":"Assinado / Não Assinado","cpf_presente":true}],"autores_faltantes":[],"problemas":["somente: autor sem assinatura ou título incompatível"],"resumo":"explicação do veredito"}`;
+
+async function getPromptTemplate(key, defaultTemplate) {
+    try {
+        const res = await pool.query("SELECT value FROM settings WHERE key = $1", [key]);
+        if (res.rows.length > 0 && res.rows[0].value) {
+            const val = res.rows[0].value;
+            return typeof val === 'string' ? val : JSON.stringify(val);
+        }
+    } catch(e) { /* usa default */ }
+    return defaultTemplate;
+}
+
+function applyTemplate(template, vars) {
+    return Object.entries(vars).reduce((t, [k, v]) =>
+        t.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v ?? ''), template);
+}
+
+async function buildTermoPrompt(textoTermo, autores, titulo) {
+    const autoresList = Array.isArray(autores) && autores.length > 0
+        ? autores.map((a, i) => `${i + 1}. ${a.nome || a}`).join('\n')
+        : 'Nenhum autor cadastrado.';
+
+    const govbrSigs = detectGovBrSignatures(textoTermo);
+    const govbrBloco = govbrSigs.length > 0
+        ? `\nASSINATURAS DIGITAIS GOV.BR DETECTADAS (${govbrSigs.length}):\n` +
+          govbrSigs.map((s, i) => `  ${i+1}. ${s.nome}${s.data ? ' — ' + s.data : ''}`).join('\n') +
+          `\nEssas assinaturas são válidas (ICP-Brasil/Lei 14.063/2020).\n`
+        : '';
+
+    const template = await getPromptTemplate('prompt_termo', PROMPT_TERMO_DEFAULT);
+    return applyTemplate(template, { govbrBloco, autoresList, titulo: titulo || 'Não informado', textoTermo });
+}
+
+async function termoLLM(prompt, geminiKey, openrouterKey, groqKey) {
+    const errors = [];
+
+    // 1. GROQ (rápido, gratuito)
+    if (groqKey) {
+        try {
+            const result = await termoGroq(groqKey, prompt);
+            console.log('[Termo] Groq OK');
+            return { ...result, _provider: 'Groq · llama-3.3-70b' };
+        } catch(e) { errors.push('Groq: ' + e.message); console.log('[Termo] Groq falhou:', e.message); }
+    }
+
+    // 2. OpenRouter
+    if (openrouterKey) {
+        try {
+            const result = await termoOpenRouter(openrouterKey, prompt);
+            console.log('[Termo] OpenRouter OK');
+            return { ...result, _provider: 'OpenRouter · llama-3.3-70b' };
+        } catch(e) { errors.push('OpenRouter: ' + e.message); }
+    }
+
+    // 3. Gemini
+    if (geminiKey) {
+        try {
+            const body = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
+            const raw = await geminiGenerateRaw(geminiKey, body);
+            const result = parseTermoJSON(raw);
+            console.log('[Termo] Gemini OK');
+            return { ...result, _provider: 'Gemini' };
+        } catch(e) { errors.push('Gemini: ' + e.message); }
+    }
+
+    // 4. Ollama local (último recurso — CPU, lento)
+    try {
+        console.log('[Termo] Tentando Ollama Local (fallback)...');
+        const res = await ollamaRequest(prompt);
+        if (res.status === 200 && res.json?.response) {
+            console.log('[Termo] Ollama OK');
+            return { ...parseTermoJSON(res.json.response), _provider: 'Ollama · llama3.2 (local)' };
+        }
+        throw new Error('Ollama status ' + res.status);
+    } catch(e) { errors.push('Ollama: ' + e.message); }
+
+    throw new Error('Todos os provedores falharam: ' + errors.join(' | '));
+}
+
+async function termoOpenRouter(apiKey, prompt) {
+    const body = JSON.stringify({
+        model: 'meta-llama/llama-3.3-70b-instruct:free',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 2000,
+        temperature: 0.2
+    });
+    const response = await new Promise((resolve, reject) => {
+        const options = {
+            hostname: 'openrouter.ai',
+            path: '/api/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'HTTP-Referer': 'https://poisson.com.br',
+                'X-Title': 'Poisson ERP',
+                'Content-Length': Buffer.byteLength(body)
+            },
+            timeout: 120000
+        };
+        const req2 = require('https').request(options, (r) => {
+            let data = '';
+            r.on('data', c => data += c);
+            r.on('end', () => resolve({ status: r.statusCode, body: data }));
+        });
+        req2.on('error', reject);
+        req2.write(body);
+        req2.end();
+    });
+    if (response.status !== 200) {
+        const err = JSON.parse(response.body || '{}');
+        throw new Error(err?.error?.message || response.status);
+    }
+    const data = JSON.parse(response.body);
+    const raw = data.choices?.[0]?.message?.content || '';
+    return parseTermoJSON(raw);
+}
+
+async function termoGroq(apiKey, prompt) {
+    const body = JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 2000,
+        temperature: 0.2
+    });
+    const response = await new Promise((resolve, reject) => {
+        const options = {
+            hostname: 'api.groq.com',
+            path: '/openai/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Length': Buffer.byteLength(body)
+            },
+            timeout: 60000
+        };
+        const req2 = require('https').request(options, (r) => {
+            let data = '';
+            r.on('data', c => data += c);
+            r.on('end', () => resolve({ status: r.statusCode, body: data }));
+        });
+        req2.on('error', reject);
+        req2.write(body);
+        req2.end();
+    });
+    if (response.status !== 200) {
+        const err = JSON.parse(response.body || '{}');
+        throw new Error(err?.error?.message || response.status);
+    }
+    const data = JSON.parse(response.body);
+    const raw = data.choices?.[0]?.message?.content || '';
+    return parseTermoJSON(raw);
+}
+
+function parseTermoJSON(raw) {
+    console.log('[Termo] raw (200 chars):', raw.substring(0, 200));
+    let jsonStr = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonMatch) jsonStr = jsonMatch[0];
+    return JSON.parse(jsonStr);
+}
+
+module.exports = router;

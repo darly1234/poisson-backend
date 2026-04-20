@@ -14,17 +14,16 @@ function normalizeFilename(name) {
         .replace(/[^a-zA-Z0-9.\-_]/g, '_');
 }
 
-const ANEXOS_PATH = process.platform === 'win32'
-    ? 'C:\\projeto_poisson_erp\\diversos\\ativos'
-    : '/home/darly/projeto_poisson_erp/diversos/ativos';
+const BASE_PATH = process.platform === 'win32'
+    ? 'C:\\projeto_poisson_erp'
+    : '/home/darly/projeto_poisson_erp';
 
-// Garante que a pasta existe (redundância de segurança)
-try {
-    if (!fs.existsSync(ANEXOS_PATH)) {
-        fs.mkdirSync(ANEXOS_PATH, { recursive: true });
-    }
-} catch (e) {
-    console.error('Error creating directory:', e);
+// Determina subpasta com base no prefixo do ID
+function getSubfolder(id) {
+    if (!id) return 'diversos';
+    if (id.startsWith('A-')) return 'artigos';
+    if (id.startsWith('I-') || id.startsWith('C-')) return 'livros';
+    return 'diversos';
 }
 
 router.use(fileUpload());
@@ -34,34 +33,57 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ error: 'Nenhum arquivo enviado' });
     }
 
-    const { id } = req.body; // ID do livro (ex: I-001 ou DRAFT)
+    const { id } = req.body; // ID do registro (ex: I-0010, A-0001, DRAFT)
     const file = req.files.file;
 
+    const subfolder = getSubfolder(id);
+    const recordDir = path.join(BASE_PATH, subfolder, id || 'diversos');
+    console.log(`[Uploads] Base Path: ${BASE_PATH}, Subfolder: ${subfolder}, ID: ${id}`);
+    console.log(`[Uploads] Target Directory: ${recordDir}`);
+
+    // Garante que a pasta do registro existe
+    try {
+        if (!fs.existsSync(recordDir)) {
+            console.log(`[Uploads] Creating directory: ${recordDir}`);
+            fs.mkdirSync(recordDir, { recursive: true });
+        }
+    } catch (e) {
+        console.error('[Uploads] Error creating directory:', e);
+    }
+
     // Lista arquivos na pasta para determinar o próximo sequencial para este ID
-    const files = fs.readdirSync(ANEXOS_PATH);
-    const idPrefix = `${id}-`;
-    const count = files.filter(f => f.startsWith(idPrefix)).length;
+    let count = 0;
+    try {
+        const filesExists = fs.readdirSync(recordDir);
+        const idPrefix = `${id}-`;
+        count = filesExists.filter(f => f.startsWith(idPrefix)).length;
+    } catch (e) { }
     const nextSeq = count + 1;
 
     // Padronização do Nome: ID-N_NomeOriginal
-    // Removemos caracteres estranhos do nome original para evitar problemas de URL
     const safeName = normalizeFilename(file.name);
     const newFileName = `${id}-${nextSeq}_${safeName}`;
-    const uploadPath = path.join(ANEXOS_PATH, newFileName);
+    const uploadPath = path.join(recordDir, newFileName);
+
+    console.log(`[Uploads] Saving file to: ${uploadPath}`);
 
     await file.mv(uploadPath);
     try {
         fs.chmodSync(uploadPath, 0o755);
+        console.log(`[Uploads] Permissions set for: ${uploadPath}`);
     } catch (e) {
-        console.error('Error setting permissions:', e);
+        console.error('[Uploads] Error setting permissions:', e);
     }
 
+    // URL pública: /api/anexos/livros/I-0010/I-0010-1_arquivo.docx
+    const publicUrl = `/api/anexos/${subfolder}/${id || 'diversos'}/${newFileName}`;
 
-    // Retorna a URL pública para o frontend
+    console.log(`[Uploads] Upload complete. URL: ${publicUrl}`);
+
     res.json({
         success: true,
         name: newFileName,
-        url: `/api/anexos/diversos/ativos/${req.files.file.name}`
+        url: publicUrl
     });
 });
 

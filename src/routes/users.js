@@ -4,6 +4,7 @@ const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const pool = require('../db');
 const { requireAuth } = require('../middleware/authMiddleware');
+const { sendEmail } = require('../utils/email');
 
 const BCRYPT_ROUNDS = 12;
 const APP_URL = process.env.APP_URL || 'http://localhost:3000';
@@ -16,26 +17,11 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 
-// Reutiliza getMailer do auth.js sem duplicar — busca SMTP nas settings
-const getMailer = async () => {
-  try {
-    const nodemailer = require('nodemailer');
-    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'smtp_config'");
-    const smtp = rows[0]?.value;
-    if (!smtp?.host) return null;
-    return nodemailer.createTransport({
-      host: smtp.host, port: parseInt(smtp.port) || 587,
-      secure: smtp.secure === true,
-      auth: { user: smtp.user, pass: smtp.pass },
-    });
-  } catch { return null; }
-};
-
 // GET /api/users — listar todos os usuários
 router.get('/', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, name, email, role, created_at FROM users ORDER BY id ASC'
+      'SELECT id, name, email, role, whatsapp, orcid, bio, created_at FROM users ORDER BY id ASC'
     );
     res.json(rows);
   } catch (err) {
@@ -45,7 +31,7 @@ router.get('/', requireAuth, requireAdmin, async (req, res) => {
 
 // POST /api/users — criar usuário
 router.post('/', requireAuth, requireAdmin, async (req, res) => {
-  const { name, email, password, role } = req.body;
+  const { name, email, password, role, whatsapp, orcid, bio } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ message: 'Nome, e-mail e senha são obrigatórios.' });
   }
@@ -57,8 +43,8 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
 
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const { rows } = await pool.query(
-      'INSERT INTO users (name, email, password_hash, role, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, name, email, role, created_at',
-      [name.trim(), email.toLowerCase().trim(), hash, userRole]
+      'INSERT INTO users (name, email, password_hash, role, whatsapp, orcid, bio, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id, name, email, role, whatsapp, orcid, bio, created_at',
+      [name.trim(), email.toLowerCase().trim(), hash, userRole, whatsapp || null, orcid || null, bio || null]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -66,22 +52,29 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// PUT /api/users/:id — editar nome, e-mail ou role
-router.put('/:id', requireAuth, requireAdmin, async (req, res) => {
-  const { name, email, role } = req.body;
+// PUT /api/users/:id — editar perfil (admin pode editar qualquer um; usuário pode editar a si mesmo)
+router.put('/:id', requireAuth, async (req, res) => {
+  const { name, email, role, whatsapp, orcid, bio } = req.body;
   const { id } = req.params;
+  const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+  const isSelf  = req.user.id === parseInt(id);
+  if (!isAdmin && !isSelf) return res.status(403).json({ message: 'Acesso negado.' });
+
   const validRoles = ['admin', 'organizador', 'autor', 'user'];
   try {
     const fields = [];
     const vals = [];
     let i = 1;
-    if (name) { fields.push(`name = $${i++}`); vals.push(name.trim()); }
-    if (email) { fields.push(`email = $${i++}`); vals.push(email.toLowerCase().trim()); }
-    if (role && validRoles.includes(role)) { fields.push(`role = $${i++}`); vals.push(role); }
+    if (name !== undefined)  { fields.push(`name = $${i++}`);     vals.push(name?.trim() || null); }
+    if (isAdmin && email)    { fields.push(`email = $${i++}`);    vals.push(email.toLowerCase().trim()); }
+    if (isAdmin && role && validRoles.includes(role)) { fields.push(`role = $${i++}`); vals.push(role); }
+    if (whatsapp !== undefined) { fields.push(`whatsapp = $${i++}`); vals.push(whatsapp ? whatsapp.trim() : null); }
+    if (orcid    !== undefined) { fields.push(`orcid = $${i++}`);    vals.push(orcid ? orcid.trim() : null); }
+    if (bio      !== undefined) { fields.push(`bio = $${i++}`);      vals.push(bio || null); }
     if (!fields.length) return res.status(400).json({ message: 'Nenhum campo para atualizar.' });
     vals.push(parseInt(id));
     const { rows } = await pool.query(
-      `UPDATE users SET ${fields.join(', ')} WHERE id = $${i} RETURNING id, name, email, role, created_at`,
+      `UPDATE users SET ${fields.join(', ')} WHERE id = $${i} RETURNING id, name, email, role, whatsapp, orcid, bio, created_at`,
       vals
     );
     if (!rows.length) return res.status(404).json({ message: 'Usuário não encontrado.' });
@@ -125,31 +118,28 @@ router.post('/:id/send-reminder', requireAuth, requireAdmin, async (req, res) =>
     );
 
     const resetUrl = `${APP_URL}/reset?token=${token}`;
-    const mailer = await getMailer();
 
-    if (mailer) {
-      const { rows: smtpRows } = await pool.query("SELECT value FROM settings WHERE key = 'smtp_config'");
-      const smtp = smtpRows[0]?.value;
-      await mailer.sendMail({
-        from: smtp ? `${smtp.from_name} <${smtp.from_email}>` : `Poisson ERP <${process.env.SMTP_USER}>`,
-        to: user.email,
-        subject: 'Lembrete: Redefina sua senha — Poisson ERP',
-        html: `
-          <div style="font-family:sans-serif;max-width:480px;margin:auto">
-            <h2 style="color:#1F2A8A">Olá, ${user.name}!</h2>
-            <p>O administrador solicitou a redefinição da sua senha no sistema <strong>Poisson ERP</strong>.</p>
-            <div style="margin:24px 0">
-              <a href="${resetUrl}" style="display:inline-block;background:#1E88E5;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:bold">Redefinir Senha</a>
-            </div>
-            <p style="color:#999;font-size:12px">O link expira em 24 horas. Se não foi você, ignore este e-mail.</p>
-          </div>
-        `,
-      });
-      res.json({ ok: true, sent: true });
-    } else {
-      // Sem mailer configurado — retorna o link para o admin copiar manualmente
-      res.json({ ok: true, sent: false, resetUrl });
-    }
+    const subject = 'Lembrete: Redefina sua senha — Poisson ERP';
+    const html = `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto">
+        <h2 style="color:#1F2A8A">Olá, ${user.name}!</h2>
+        <p>O administrador solicitou a redefinição da sua senha no sistema <strong>Poisson ERP</strong>.</p>
+        <div style="margin:24px 0">
+          <a href="${resetUrl}" style="display:inline-block;background:#1E88E5;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:bold">Redefinir Senha</a>
+        </div>
+        <p style="color:#999;font-size:12px">O link expira em 24 horas. Se não foi você, ignore este e-mail.</p>
+      </div>
+    `;
+
+    const sent = await sendEmail(pool, {
+      to: user.email,
+      subject,
+      html,
+      type: 'password_reminder',
+      extra: { name: user.name, reset_url: resetUrl },
+    });
+
+    res.json({ ok: true, sent, resetUrl: sent ? undefined : resetUrl });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -160,6 +150,11 @@ router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id);
   if (id === req.user.id) return res.status(400).json({ message: 'Você não pode excluir sua própria conta.' });
   try {
+    // Remove dependências de FK antes de deletar
+    await pool.query('UPDATE records SET author_id = NULL WHERE author_id = $1', [id]);
+    await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [id]);
+    await pool.query('DELETE FROM notifications WHERE user_id = $1', [id]).catch(() => {});
+    await pool.query('DELETE FROM user_presence WHERE user_id = $1', [id]).catch(() => {});
     const { rowCount } = await pool.query('DELETE FROM users WHERE id = $1', [id]);
     if (!rowCount) return res.status(404).json({ message: 'Usuário não encontrado.' });
     res.json({ ok: true });

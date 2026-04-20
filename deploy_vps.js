@@ -7,19 +7,19 @@ echo "=================================="
 echo "Atualizando Backend..."
 echo "=================================="
 cd /var/www/poisson-backend || exit
-git stash
-git pull origin main
+git fetch origin main
+git reset --hard origin/main
 npm install
-pm2 restart poisson-api
+pm2 restart poisson-api || pm2 start server.js --name poisson-api
 
 echo " "
 echo "=================================="
 echo "Atualizando Frontend (ERP)..."
 echo "=================================="
 cd /var/www/poisson-erp || exit
-git stash
-git pull origin main
-npm install
+git fetch origin main
+git reset --hard origin/main
+npm install --legacy-peer-deps
 npm run build
 
 echo " "

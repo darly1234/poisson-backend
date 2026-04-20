@@ -9,63 +9,385 @@ const path = require('path');
 
 // ── Mensagens / Envio ─────────────────────────────────────────────────────────
 
+// ── Slack API (n8n Bridge - evita conexão direta Postgres) ──────────────────
+// Criar tabela se não existir
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS notificacoes_slack (
+                id SERIAL PRIMARY KEY,
+                record_id TEXT,
+                id_grupo TEXT,
+                parent_grupo TEXT NULL,
+                usuario_destino TEXT,
+                nome_destino TEXT,
+                mensagem TEXT,
+                status TEXT,
+                data_envio TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                data_leitura TIMESTAMP NULL
+            )
+        `);
+        // Migração: adiciona parent_grupo se não existir
+        await pool.query(`ALTER TABLE notificacoes_slack ADD COLUMN IF NOT EXISTS parent_grupo TEXT NULL`);
+    } catch(err) { console.error('[Slack Table Check]', err.message); }
+})();
+
+// 1. Listar Destinatários do Slack (n8n chama este GET)
+router.get('/n8n/slack-recipients', async (req, res) => {
+    try {
+        const result = await pool.query("SELECT slack_id as id, slack_id, nome as name FROM canais_notificacao ORDER BY nome ASC");
+        res.json(result.rows);
+    } catch (err) {
+        console.error('[n8n Slack Bridge] Erro ao buscar destinatários:', err.message);
+        res.status(500).json({ error: 'Erro ao buscar no banco.' });
+    }
+});
+
+// 2. Sincronizar Destinatários (n8n chama este POST para enviar a lista real do Slack)
+router.post('/n8n/sync-recipients', async (req, res) => {
+    const { recipients } = req.body; // Array de { nome, slack_id, tipo }
+    if (!Array.isArray(recipients)) return res.status(400).json({ error: 'Formato inválido. Esperado array.' });
+
+    try {
+        for (const r of recipients) {
+            await pool.query(
+                `INSERT INTO canais_notificacao (nome, slack_id, tipo) 
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (slack_id) DO UPDATE SET nome = EXCLUDED.nome, tipo = EXCLUDED.tipo`,
+                [r.nome, r.slack_id, r.tipo || 'user']
+            );
+        }
+        res.json({ success: true, count: recipients.length });
+    } catch (err) {
+        console.error('[n8n Slack Bridge] Erro ao sincronizar:', err.message);
+        res.status(500).json({ error: 'Erro ao salvar no banco.' });
+    }
+});
+
+// 3. Salvar log de Envio OU Confirmação de Leitura (n8n chama este POST)
+// Quando status === "LIDO": atualiza o registro com confirmação de leitura (auditoria)
+// Caso contrário: salva log de envio inicial
+router.post('/n8n/slack-save', async (req, res) => {
+    const { recordId, status, usuario, groupId, recipients, message } = req.body;
+
+    // ── Confirmação de Leitura (botão clicado no Slack) ─────────────────────
+    if (status === 'LIDO') {
+        if (!recordId || !usuario) {
+            return res.status(400).json({ error: 'recordId e usuario são obrigatórios.' });
+        }
+        try {
+            const idStr = String(recordId);
+            const groupIdStr = groupId ? String(groupId) : null;
+            const dataLeitura = new Date().toISOString();
+
+            let updateResult;
+            if (groupIdStr) {
+                // Precisão total: marca apenas a mensagem específica daquele disparo + usuário
+                updateResult = await pool.query(
+                    `UPDATE notificacoes_slack
+                     SET status = 'confirmado', data_leitura = NOW()
+                     WHERE id_grupo = $1
+                       AND (
+                         usuario_destino = $2
+                         OR nome_destino = $2
+                         OR usuario_destino = (SELECT slack_id FROM canais_notificacao WHERE LOWER(nome) = LOWER($2) LIMIT 1)
+                       )
+                       AND status != 'confirmado'`,
+                    [groupIdStr, usuario]
+                );
+            } else {
+                // Fallback sem groupId: marca apenas a 1 linha mais recente daquele usuário/record
+                updateResult = await pool.query(
+                    `UPDATE notificacoes_slack
+                     SET status = 'confirmado', data_leitura = NOW()
+                     WHERE id = (
+                         SELECT id FROM notificacoes_slack
+                         WHERE record_id = $1
+                           AND (
+                             usuario_destino = $2
+                             OR nome_destino = $2
+                             OR usuario_destino = (SELECT slack_id FROM canais_notificacao WHERE LOWER(nome) = LOWER($2) LIMIT 1)
+                           )
+                           AND status != 'confirmado'
+                         ORDER BY data_envio DESC
+                         LIMIT 1
+                     )`,
+                    [idStr, usuario]
+                );
+            }
+
+            console.log(`[n8n Slack Save] Rows updated: ${updateResult.rowCount}, groupId=${groupIdStr}, usuario=${usuario}`);
+
+            // Se havia um parent_grupo (reenvio), marca o original como lido também
+            if (groupIdStr) {
+                const parentRes = await pool.query(
+                    `SELECT DISTINCT parent_grupo FROM notificacoes_slack WHERE id_grupo = $1 AND parent_grupo IS NOT NULL LIMIT 1`,
+                    [groupIdStr]
+                );
+                const parentGrupo = parentRes.rows[0]?.parent_grupo;
+                if (parentGrupo) {
+                    await pool.query(
+                        `UPDATE notificacoes_slack
+                         SET status = 'confirmado', data_leitura = NOW()
+                         WHERE id_grupo = $1
+                           AND (usuario_destino = $2 OR nome_destino = $2)
+                           AND status != 'confirmado'`,
+                        [parentGrupo, usuario]
+                    );
+                    console.log(`[n8n Slack Save] Parent grupo marcado como lido: ${parentGrupo}`);
+                }
+            }
+
+            // Auditoria: registra quem leu e quando
+            await pool.query(
+                `INSERT INTO message_logs (record_id, template_name, message_content, status, response_data)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [
+                    idStr,
+                    'Slack - Confirmação de Leitura',
+                    `Leitura confirmada por: ${usuario}`,
+                    'Sucesso',
+                    JSON.stringify({ usuario, groupId: groupIdStr, data_leitura: dataLeitura, recordId: idStr })
+                ]
+            );
+
+            console.log(`[n8n Slack Save] Leitura confirmada: record=${idStr}, groupId=${groupIdStr}, usuario=${usuario}`);
+            return res.json({ success: true });
+        } catch (err) {
+            console.error('[n8n Slack Save] Erro ao salvar confirmação de leitura:', err.message);
+            return res.status(500).json({ error: 'Erro ao atualizar confirmação de leitura.' });
+        }
+    }
+
+    // ── Log de Envio Inicial ─────────────────────────────────────────────────
+    try {
+        const list = Array.isArray(recipients) ? [...recipients] : [];
+        if (list.length === 0) {
+            const single = {
+                id: req.body.slack_id || req.body.id_destino,
+                name: req.body.name || req.body.nome || 'Destinatário Desconhecido'
+            };
+            if (single.id) list.push(single);
+        }
+
+        if (list.length === 0) {
+            return res.json({ success: true, count: 0 });
+        }
+
+        const finalRecordId = String(recordId || req.body.groupId || '');
+        const finalGroupId = String(req.body.groupId || recordId || '');
+
+        const queries = list.map(r =>
+            pool.query(
+                "INSERT INTO notificacoes_slack (record_id, id_grupo, usuario_destino, nome_destino, mensagem, status, data_envio) VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+                [finalRecordId, finalGroupId, r.slack_id || r.id || '', r.name || r.nome || 'Destinatário', message || '', 'enviado']
+            )
+        );
+
+        await Promise.all(queries);
+        res.json({ success: true, count: list.length });
+    } catch (err) {
+        console.error('[n8n Slack Bridge] Erro ao salvar log de envio (v2.30):', err.message);
+        res.status(500).json({ error: 'Erro ao salvar no banco.' });
+    }
+});
+
+// 3. Atualizar status de Leitura (n8n chama este POST quando alguém clica no Slack)
+router.post('/n8n/slack-update', async (req, res) => {
+    const { slack_id, groupId } = req.body;
+    try {
+        await pool.query(
+            "UPDATE notificacoes_slack SET status = 'confirmado', data_leitura = NOW() WHERE usuario_destino = $1 AND id_grupo = $2 AND status = 'enviado'",
+            [slack_id, groupId]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[n8n Slack Bridge] Erro ao atualizar status:', err.message);
+        res.status(500).json({ error: 'Erro ao atualizar no banco.' });
+    }
+});
+
+// 4. Túnel de Disparo (ERP chama este POST para evitar erro de CORS do n8n)
+router.post('/n8n/slack-dispatch', async (req, res) => {
+    const { recordId, message, recipients, parentGroupId } = req.body;
+    try {
+        // 1. Buscar as configurações do Slack
+        const settingsRes = await pool.query("SELECT value FROM settings WHERE key = 'slack_settings'");
+        let slackSettings = settingsRes.rows[0]?.value;
+        let webhookUrl = 'https://n8.poisson.com.br/webhook/slack-enviar-mensagem';
+
+        if (slackSettings) {
+            try {
+                // Caso esteja no formato { encrypted: "..." }
+                let configData = slackSettings;
+                if (typeof configData === 'object' && configData.encrypted) {
+                    configData = configData.encrypted;
+                }
+
+                // Se for uma string com IV (iv:content)
+                if (typeof configData === 'string' && configData.includes(':')) {
+                    const decrypted = decrypt(configData);
+                    try {
+                        const parsed = JSON.parse(decrypted);
+                        if (parsed && parsed.url_envio) webhookUrl = parsed.url_envio;
+                    } catch (e) {
+                        // Se não for JSON, tenta usar como string pura
+                        if (decrypted && decrypted.startsWith('http')) webhookUrl = decrypted;
+                    }
+                } else if (typeof configData === 'object' && configData.url_envio) {
+                    webhookUrl = configData.url_envio;
+                }
+            } catch (err) {
+                console.error('[n8n Slack Dispatch] Falha na descriptografia (usando fallback):', err.message);
+            }
+        }
+
+        console.log('[n8n Slack Dispatch] Disparando para:', webhookUrl);
+
+        // 2. Gerar groupId único para este envio
+        const groupId = `${recordId}-${Date.now()}`;
+
+        // 3. Salvar no histórico local ANTES de enviar (garante registro mesmo se n8n falhar)
+        try {
+            const list = Array.isArray(recipients) ? recipients.filter(r => r.slack_id || r.id) : [];
+            const insertQueries = list.map(r =>
+                pool.query(
+                    "INSERT INTO notificacoes_slack (record_id, id_grupo, parent_grupo, usuario_destino, nome_destino, mensagem, status, data_envio) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+                    [recordId, groupId, parentGroupId || null, r.slack_id || r.id, r.name || r.nome || 'Destinatário', message, 'enviado']
+                )
+            );
+            if (insertQueries.length > 0) await Promise.all(insertQueries);
+        } catch (dbErr) {
+            console.error('[n8n Slack Dispatch] Erro ao salvar histórico local:', dbErr.message);
+            // Continua o envio mesmo se o log falhar
+        }
+
+        // 4. Repassar para o n8n via server-side fetch
+        const response = await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                recordId,
+                groupId,
+                message,
+                recipients: recipients || []
+            })
+        });
+
+        if (!response.ok) {
+            const errBody = await response.text();
+            return res.status(response.status).json({
+                error: `n8n recusou: ${response.status}`,
+                details: errBody
+            });
+        }
+
+        res.json({ success: true, groupId });
+    } catch (err) {
+        console.error('[n8n Slack Dispatch] ERRO FATAL NO TÚNEL:', err.message);
+        res.status(500).json({ error: 'Erro interno no túnel de disparo', details: err.message });
+    }
+});
+
+// 5a. Deletar grupo de mensagem específico
+router.delete('/slack/group/:groupId', async (req, res) => {
+    try {
+        const result = await pool.query(
+            "DELETE FROM notificacoes_slack WHERE id_grupo = $1",
+            [req.params.groupId]
+        );
+        res.json({ success: true, deleted: result.rowCount });
+    } catch (err) {
+        console.error('[Slack Delete Group]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 5. Listar Histórico (ERP chama este via api.js)
+router.get('/history-slack/:recordId', async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id, id_grupo, usuario_destino, nome_destino, mensagem, status, data_envio, data_leitura FROM notificacoes_slack WHERE record_id = $1 OR id_grupo = $1 ORDER BY data_envio DESC",
+            [req.params.recordId]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('[Slack History] Erro:', err.message);
+        res.status(500).json({ error: 'Erro ao buscar histórico.' });
+    }
+});
+
+// ── Mensagens Legadas / Gerais ───────────────────────────────────────────────
 router.post('/send', async (req, res) => {
-    const { recordId, subject, message, templateName } = req.body;
+    const { recordId, subject, message, templateName, recipient } = req.body;
 
     if (!recordId || !message) {
         return res.status(400).json({ message: 'RecordID e Mensagem são obrigatórios.' });
     }
 
     try {
-        // 1. Buscar a URL do Webhook do n8n nas configurações
-        const settingsRes = await pool.query("SELECT value FROM settings WHERE key = 'n8n_webhook_url'");
-        let webhookUrlRaw = settingsRes.rows[0]?.value;
-        
-        // Descriptografar se necessário
-        if (typeof webhookUrlRaw === 'string' && webhookUrlRaw.includes(':')) {
-            try {
-                const decrypted = decrypt(webhookUrlRaw);
-                try {
-                    webhookUrlRaw = JSON.parse(decrypted);
-                } catch (e) {
-                    webhookUrlRaw = decrypted;
-                }
-            } catch (e) {
-                // Se falhar a descriptografia, mantém original
+        // 1. Buscar configurações SMTP (onde fica o endpoint n8n)
+        const smtpRes = await pool.query("SELECT value FROM settings WHERE key = 'smtp_config'");
+        let smtpConfig = smtpRes.rows[0]?.value || {};
+        // Formato { encrypted: "iv:content" } — padrão atual do sistema
+        if (smtpConfig && typeof smtpConfig === 'object' && smtpConfig.encrypted) {
+            try { smtpConfig = JSON.parse(decrypt(smtpConfig.encrypted)); } catch(e) { smtpConfig = {}; }
+        } else if (typeof smtpConfig === 'string') {
+            try { smtpConfig = JSON.parse(smtpConfig); } catch(e) {}
+            if (typeof smtpConfig === 'string' && smtpConfig.includes(':')) {
+                try { smtpConfig = JSON.parse(decrypt(smtpConfig)); } catch(e) { smtpConfig = {}; }
             }
         }
-        
-        const webhookUrl = webhookUrlRaw?.url;
 
-        if (!webhookUrl) {
-            return res.status(500).json({ message: 'URL do Webhook do n8n não configurada.' });
+        const n8nEndpoint = smtpConfig?.n8n_endpoint || '';
+
+        if (!n8nEndpoint) {
+            return res.status(500).json({ message: 'Endpoint n8n não configurado. Vá em Configurações → E-mail → Endpoint n8n.' });
         }
 
-        // 2. Buscar dados do registro para o payload (e para segurança do negociador)
+        // 2. Buscar dados do registro
         const recordRes = await pool.query("SELECT data FROM records WHERE id = $1", [recordId]);
         if (recordRes.rows.length === 0) {
             return res.status(404).json({ message: 'Registro não encontrado.' });
         }
-
         const recordData = recordRes.rows[0].data || {};
 
-        // Extrair informações do negociador (campo f_negotiators)
-        const negotiators = Array.isArray(recordData.f_negotiators) ? recordData.f_negotiators : [];
-        const firstNegotiator = negotiators[0] || {};
-        const negotiatorEmail = firstNegotiator.email || '';
-        const negotiatorPhoneRaw = firstNegotiator.telefone || '';
-        const negotiatorPhoneClean = negotiatorPhoneRaw.replace(/\D/g, ''); // Apenas números
+        // 3. Montar destinatário: usa o recipient enviado pelo frontend, ou cai no primeiro negociador
+        let toEmail = recipient?.email || '';
+        let toPhone = recipient?.phone || recipient?.telefone || '';
+        let toNome  = recipient?.nome || '';
+
+        if (!toEmail) {
+            const negotiators = Array.isArray(recordData.f_negotiators) ? recordData.f_negotiators : [];
+            const first = negotiators[0] || {};
+            toEmail = first.email || '';
+            toPhone = (first.telefone || '').replace(/\D/g, '');
+            toNome  = first.nome || '';
+        } else {
+            toPhone = toPhone.replace(/\D/g, '');
+        }
 
         const payload = {
-            subject: subject,
+            // Destinatário
+            to_email: toEmail,
+            to_phone: toPhone || null,   // null = sem WhatsApp, não envia string vazia
+            to_nome:  toNome,
+            // Remetente
+            from_name:  smtpConfig.from_name  || 'Editora Poisson',
+            from_email: smtpConfig.from_email  || '',
+            // Conteúdo
+            subject: subject || '',
             message: message,
-            email: negotiatorEmail,
-            telefone: negotiatorPhoneClean
+            // Contexto do registro
+            record_id: recordId,
+            titulo: recordData.titulo || recordData.f_titulo || '',
+            isbn:   recordData.isbn   || recordData.f7 || '',
+            doi:    recordData.doi    || recordData.f_doi || '',
         };
 
         // 4. Disparar para o n8n
-        console.log('[n8n] Enviando para URL:', webhookUrl);
-        const response = await fetch(webhookUrl, {
+        console.log('[n8n Email] Enviando para:', n8nEndpoint, '| to:', toEmail);
+        const response = await fetch(n8nEndpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -74,25 +396,25 @@ router.post('/send', async (req, res) => {
         const status = response.ok ? 'Sucesso' : 'Falha';
         let responseData = {};
         try { responseData = await response.json(); } catch (e) {
-            console.warn('[n8n] Resposta não é JSON');
+            console.warn('[n8n Email] Resposta não é JSON');
         }
 
         // 5. Registrar no log
         await pool.query(
             "INSERT INTO message_logs (record_id, template_name, message_content, status, response_data) VALUES ($1, $2, $3, $4, $5)",
-            [recordId, templateName || 'Personalizada', `[Assunto: ${subject || 'Sem Assunto'}]\n\n${message}`, status, JSON.stringify(responseData)]
+            [recordId, templateName || 'Personalizada', `[Para: ${toEmail}] [Assunto: ${subject || 'Sem Assunto'}]\n\n${message}`, status, JSON.stringify(responseData)]
         );
 
         if (response.ok) {
             res.json({ success: true, status });
         } else {
-            console.error('[n8n] Erro no n8n:', response.status, responseData);
+            console.error('[n8n Email] Erro:', response.status, responseData);
             res.status(response.status).json({ success: false, status, error: responseData });
         }
 
     } catch (err) {
-        console.error('[Webhook Error Detail]', err);
-        res.status(500).json({ message: 'Erro interno ao processar o envio das mensagens.', details: err.message });
+        console.error('[Webhook Send Error]', err);
+        res.status(500).json({ message: 'Erro interno ao processar o envio.', details: err.message });
     }
 });
 
@@ -340,6 +662,41 @@ router.get('/post-studio/history', async (req, res) => {
     } catch (err) {
         console.error('[Post Studio History Error]', err);
         res.status(500).json({ message: 'Erro ao buscar histórico do Post Studio.' });
+    }
+});
+
+// 5. Apagar log de um grupo específico do Slack
+router.delete('/slack/group/:groupId', async (req, res) => {
+    try {
+        await pool.query("DELETE FROM notificacoes_slack WHERE id_grupo = $1", [req.params.groupId]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Slack Delete Group Error]', err);
+        res.status(500).json({ message: 'Erro ao deletar grupo do Slack.' });
+    }
+});
+
+// 6. Apagar logs antigos de um recordId com seletor de data
+router.delete('/slack/old/:recordId', async (req, res) => {
+    const { days, beforeDate } = req.query;
+    try {
+        let query = "DELETE FROM notificacoes_slack WHERE record_id = $1";
+        const params = [req.params.recordId];
+
+        if (beforeDate) {
+            query += " AND data_envio < $2::timestamp";
+            params.push(beforeDate);
+        } else if (days) {
+            query += ` AND data_envio < NOW() - INTERVAL '${parseInt(days, 10)} days'`;
+        } else {
+            query += " AND data_envio < NOW() - INTERVAL '30 days'";
+        }
+
+        await pool.query(query, params);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Slack Delete Old Error]', err);
+        res.status(500).json({ message: 'Erro ao deletar logs antigos do Slack.' });
     }
 });
 
