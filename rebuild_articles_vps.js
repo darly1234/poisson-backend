@@ -76,22 +76,61 @@ async function main() {
       authorId = newU[0].id;
     }
 
-    // Mapeamento básico (conforme migrate_gf.js original)
+    // Mapeamento de autores (até 10 conforme migrate_gf.js)
     const authorGroups = [
       { nome: fields['69'], email: fields['70'], orcid: fields['134'], mini: fields['71'] },
       { nome: fields['72'], email: fields['73'], orcid: fields['135'], mini: fields['74'] },
       { nome: fields['77'], email: fields['76'], orcid: fields['136'], mini: fields['75'] },
       { nome: fields['80'], email: fields['79'], orcid: fields['137'], mini: fields['78'] },
       { nome: fields['83'], email: fields['82'], orcid: fields['138'], mini: fields['81'] },
-    ].filter(a => a.nome);
+      { nome: fields['86'], email: fields['85'], orcid: fields['139'], mini: fields['84'] },
+      { nome: fields['89'], email: fields['88'], orcid: fields['140'], mini: fields['87'] },
+      { nome: fields['92'], email: fields['91'], orcid: fields['141'], mini: fields['90'] },
+      { nome: fields['142'], email: fields['146'], orcid: fields['144'], mini: fields['145'] },
+      { nome: fields['152'], email: fields['150'], orcid: fields['151'], mini: fields['149'] },
+    ].filter(a => a.nome && a.nome.trim());
+
+    const mapStatusPagamento = (v) => {
+      if (!v) return 'Pendente';
+      if (v.toLowerCase().includes('pago')) return 'Pago';
+      if (v.toLowerCase().includes('isento')) return 'Isento';
+      return 'Pendente';
+    };
+
+    const mapStatusTermo = (v) => {
+      if (!v) return 'Pendente';
+      if (v.toLowerCase().includes('assinado')) return 'Assinado';
+      return 'Pendente';
+    };
 
     const recordData = {
       titulo_artigo: fields['8'] || '',
       livro_escolhido: fields['9'] || null,
+      observacoes_editora: fields['36'] || null,
       tipo_publicacao: 'artigo',
       autores_coletanea: authorGroups.map(a => ({
         nome: a.nome.trim(), email: (a.email||'').trim(), orcid: (a.orcid||'').trim(), minicurriculo: (a.mini||'').trim()
       })),
+      avaliacao_dados: {
+        status_avaliacao: fields['17'] || 'Pendente',
+        data_avaliacao: fields['115'] || null,
+        livro_sugerido: fields['23'] || null,
+        status_pagamento: mapStatusPagamento(fields['114']),
+        taxa_publicacao: fields['123'] || null,
+        data_pagamento: fields['130'] || null,
+        status_termo: mapStatusTermo(fields['113']),
+        consideracoes_avaliadores: fields['112'] || null,
+        data_ultimo_contato: fields['132'] || null,
+        administrativo: fields['128'] || null,
+      },
+      data_prevista_publicacao: fields['116'] || null,
+      status_publicacao: fields['131'] || null,
+      data_publicacao_efetiva: fields['117'] || null,
+      livro_publicacao: fields['59'] || null,
+      capitulo: fields['58'] || null,
+      isbn: fields['57'] || null,
+      doi: fields['56'] || null,
+      doi_capitulo: fields['55'] || null,
       gf_entry_id: String(entry.id)
     };
 
